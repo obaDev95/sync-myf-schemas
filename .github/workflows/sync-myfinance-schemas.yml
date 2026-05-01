@@ -1,0 +1,198 @@
+name: Sync myfinance schemas (Cursor agent)
+
+on:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "Optional regex to limit scope (e.g. 'invoices'). Matched against local schema filenames. Empty = all tracked files."
+        required: false
+        default: ""
+      dry_run:
+        description: "If true, the agent only reports what it would change."
+        type: boolean
+        default: false
+      model:
+        description: "Cursor model id (leave empty for default)."
+        required: false
+        default: ""
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────
+  # Job 1: Deterministic pre-flight gate.
+  # Clones the public API-JSON-Schema-Definitions repo, diffs every
+  # tracked myfinance YAML against schemas/, and emits a JSON change list.
+  # If nothing drifted the workflow ends here — zero Cursor tokens spent.
+  # ──────────────────────────────────────────────────────────────────────
+  detect-drift:
+    name: Detect schema drift (no agent)
+    runs-on: ubuntu-latest
+    outputs:
+      has_changes: ${{ steps.diff.outputs.has_changes }}
+      changed_files: ${{ steps.diff.outputs.changed_files }}
+      source_sha: ${{ steps.diff.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone public schema source
+        run: git clone --depth=1 https://github.com/Maersk-Global/API-JSON-Schema-Definitions /tmp/api-src
+
+      - name: Compute drift
+        id: diff
+        env:
+          ONLY: ${{ inputs.only }}
+        run: |
+          set -euo pipefail
+          SRC=/tmp/api-src
+          SOURCE_SHA=$(git -C "$SRC" rev-parse HEAD)
+
+          # ── Mapping table ──────────────────────────────────────────
+          # Each line: <remote path relative to repo root> <TAB> <local filename in schemas/>
+          # The public repo uses different directory prefixes and occasionally
+          # a "35-" filename prefix that the local copy strips.
+          # Only files we actually run codegen for are tracked.
+          MAPPING=$(cat <<'MAP'
+          apis/500-Maersk.com/v1/myfinance-invoices-API.v1.yml	myfinance-invoices-API.v1.yml
+          apis/500-Maersk.com/v2/myfinance-invoices-API.v2.yaml	myfinance-invoices-API.v2.yaml
+          apis/500-Maersk.com/v1/myfinance-submit-proof-of-payment-API.v1.yaml	myfinance-submit-proof-of-payment-API.v1.yaml
+          apis/508-PaymentsAndCheckout/v1/PNC_PaymentAvailability-API.v1.yaml	PNC_PaymentAvailability-API.v1.yaml
+          apis/508-PaymentsAndCheckout/v1/PNC_BankProfiles-API.v1.yaml	PNC_BankProfiles-API.v1.yaml
+          apis/500-Maersk.com/v1/35-myfinance-export-documents-API.v1.yml	myfinance-export-documents-API.v1.yml
+          apis/500-Maersk.com/v1/myfinance-refund-request-API.v1.yaml	myfinance-refund-request-API.v1.yaml
+          apis/500-Maersk.com/v1/myfinance-estatements-API.v1.yml	myfinance-estatements-API.v1.yml
+          apis/500-Maersk.com/v1/myfinance-workflows-API.v1.yaml	myfinance-workflows-API.v1.yaml
+          MAP
+          )
+
+          CHANGES='[]'
+
+          while IFS=$'\t' read -r remote_rel local_name; do
+            # Trim leading whitespace from heredoc indentation
+            remote_rel=$(echo "$remote_rel" | xargs)
+            local_name=$(echo "$local_name" | xargs)
+
+            # Honour the ONLY filter (matched against local filename)
+            if [ -n "$ONLY" ] && ! echo "$local_name" | grep -Eq "$ONLY"; then
+              continue
+            fi
+
+            remote_path="$SRC/$remote_rel"
+            local_path="schemas/$local_name"
+
+            if [ ! -f "$remote_path" ]; then
+              # Remote file was removed — local schema should be deleted
+              if [ -f "$local_path" ]; then
+                CHANGES=$(echo "$CHANGES" | jq --arg r "$remote_rel" --arg l "$local_name" \
+                  '. + [{"remote": $r, "local": $l, "status": "deleted"}]')
+              fi
+            elif [ ! -f "$local_path" ]; then
+              # Remote file exists but local does not — new schema
+              CHANGES=$(echo "$CHANGES" | jq --arg r "$remote_rel" --arg l "$local_name" \
+                '. + [{"remote": $r, "local": $l, "status": "added"}]')
+            elif ! diff -q "$remote_path" "$local_path" >/dev/null 2>&1; then
+              # Both exist but content differs — modified
+              CHANGES=$(echo "$CHANGES" | jq --arg r "$remote_rel" --arg l "$local_name" \
+                '. + [{"remote": $r, "local": $l, "status": "modified"}]')
+            fi
+          done <<< "$MAPPING"
+
+          TOTAL=$(echo "$CHANGES" | jq 'length')
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "## No schema drift detected"
+              echo ""
+              echo "Source SHA: \`$SOURCE_SHA\`"
+              echo ""
+              echo "_The Cursor agent was NOT launched. Zero tokens spent._"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "changed_files=$(echo "$CHANGES" | jq -c '.')" >> "$GITHUB_OUTPUT"
+
+          ADDED=$(echo "$CHANGES"   | jq '[.[] | select(.status == "added")]   | length')
+          MODIFIED=$(echo "$CHANGES" | jq '[.[] | select(.status == "modified")] | length')
+          DELETED=$(echo "$CHANGES"  | jq '[.[] | select(.status == "deleted")]  | length')
+
+          {
+            echo "## Schema drift detected"
+            echo ""
+            echo "Source SHA: \`$SOURCE_SHA\`"
+            echo ""
+            echo "**Added ($ADDED)**"
+            echo "$CHANGES" | jq -r '.[] | select(.status == "added")   | "- `\(.local)` ← \(.remote)"'
+            echo ""
+            echo "**Modified ($MODIFIED)**"
+            echo "$CHANGES" | jq -r '.[] | select(.status == "modified") | "- `\(.local)` ← \(.remote)"'
+            echo ""
+            echo "**Deleted ($DELETED)**"
+            echo "$CHANGES" | jq -r '.[] | select(.status == "deleted")  | "- `\(.local)`"'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Job 2: Launch the Cursor Cloud Agent.
+  # Only runs when detect-drift found at least one changed file.
+  # Embeds the pre-computed change list and source SHA into the prompt
+  # so the agent skips re-enumeration entirely.
+  # ──────────────────────────────────────────────────────────────────────
+  launch-agent:
+    name: Launch Cursor agent
+    runs-on: ubuntu-latest
+    needs: detect-drift
+    if: needs.detect-drift.outputs.has_changes == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build prompt
+        id: prompt
+        env:
+          ONLY: ${{ inputs.only }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          ACTOR: ${{ github.actor }}
+          CHANGED_FILES: ${{ needs.detect-drift.outputs.changed_files }}
+          SOURCE_SHA: ${{ needs.detect-drift.outputs.source_sha }}
+        run: |
+          PROMPT=$(envsubst < .cursor/prompts/sync-myfinance-schemas.md)
+          {
+            echo 'text<<EOF'
+            echo "$PROMPT"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Launch Cursor agent
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          BODY=$(jq -n \
+            --arg text "${{ steps.prompt.outputs.text }}" \
+            --arg repo "https://github.com/${{ github.repository }}" \
+            --arg branch "cursor/sync-myfinance-${{ github.run_id }}" \
+            '{
+              prompt: { text: $text },
+              repos: [{ url: $repo, startingRef: "${{ github.event.repository.default_branch }}" }],
+              branchName: $branch,
+              autoCreatePR: true
+            }')
+
+          if [ -n "${{ inputs.model }}" ]; then
+            BODY=$(echo "$BODY" | jq --arg m "${{ inputs.model }}" '. + { model: { id: $m } }')
+          fi
+
+          RESP=$(curl -sS -X POST https://api.cursor.com/v1/agents \
+            -u "${CURSOR_API_KEY}:" \
+            -H 'Content-Type: application/json' \
+            -d "$BODY")
+
+          echo "$RESP" | jq .
+          AGENT_URL=$(echo "$RESP" | jq -r '.agent.url // "unknown"')
+          FILE_COUNT=$(echo '${{ needs.detect-drift.outputs.changed_files }}' | jq 'length')
+          {
+            echo "### Cursor agent launched"
+            echo "- Agent: $AGENT_URL"
+            echo "- Branch: \`cursor/sync-myfinance-${{ github.run_id }}\`"
+            echo "- Source SHA: \`${{ needs.detect-drift.outputs.source_sha }}\`"
+            echo "- Files passed in: $FILE_COUNT YAML(s)"
+          } >> "$GITHUB_STEP_SUMMARY"
