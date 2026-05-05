@@ -230,12 +230,10 @@ jobs:
           BODY=$(jq -n \
             --rawfile text /tmp/agent-prompt.txt \
             --arg repo "https://github.com/Maersk-Global/ui-myfinance" \
-            --arg branch "cursor/sync-myfinance-${{ github.run_id }}" \
             --arg ref "$REF" \
             '{
               prompt: { text: $text },
               repos: [{ url: $repo, startingRef: $ref }],
-              branchName: $branch,
               autoCreatePR: true,
               skipReviewerRequest: true
             }')
@@ -258,6 +256,7 @@ jobs:
           AGENT_ID=$(jq -r '.agent.id' /tmp/create-agent.json)
           RUN_ID=$(jq -r '.run.id' /tmp/create-agent.json)
           AGENT_URL=$(jq -r '.agent.url // "unknown"' /tmp/create-agent.json)
+          BRANCH=$(jq -r '.agent.branchName // "auto-generated"' /tmp/create-agent.json)
 
           FILE_COUNT=$(echo '${{ needs.detect-drift.outputs.changed_files }}' | jq 'length')
 
@@ -298,7 +297,7 @@ jobs:
             echo "- Target repo (PR opens here): **Maersk-Global/ui-myfinance**"
             echo "- Agent: $AGENT_URL"
             echo "- Run: \`$RUN_ID\`"
-            echo "- Branch: \`cursor/sync-myfinance-${{ github.run_id }}\` (from \`$REF\`)"
+            echo "- Branch: \`$BRANCH\` (from \`$REF\`)"
             echo "- Source SHA (API schemas): \`${{ needs.detect-drift.outputs.source_sha }}\`"
             echo "- Files passed in: $FILE_COUNT YAML(s)"
             echo ""
