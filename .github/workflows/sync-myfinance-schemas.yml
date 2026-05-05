@@ -9,8 +9,14 @@
 #   curl -sS https://api.cursor.com/v1/repositories -u "$CURSOR_API_KEY:" \
 #     | jq '.items[] | select(.url | contains("ui-myfinance"))'
 #
+# For auto-created PRs, the Cursor GitHub App must also be allowed to push a branch and open
+# pull requests on Maersk-Global/ui-myfinance (not read-only).
+#
 # The Cloud Agent must use repos[].url = ui-myfinance. If you pass github.repository here,
 # the agent runs against this automation repo and any PR opens there — not in ui-myfinance.
+#
+# PR creation: autoCreatePR opens a GitHub PR only after the Cloud Agent run reaches FINISHED.
+# If the run ends in ERROR (wrong startingRef, push denied, etc.), no PR appears — check the agent URL.
 
 name: Sync myfinance schemas (Cursor agent)
 
@@ -30,9 +36,17 @@ on:
         required: false
         default: ""
       ui_myfinance_default_branch:
-        description: "Default branch on Maersk-Global/ui-myfinance (Cloud Agent startingRef)."
+        description: "repos[0].startingRef for ui-myfinance. Leave empty to resolve the repo default branch via the GitHub API."
         required: false
-        default: "main"
+        default: ""
+      wait_for_agent_run:
+        description: "Poll until the Cursor run finishes. PR is created only after status FINISHED; enable this to catch ERROR runs before the job exits."
+        type: boolean
+        default: true
+      agent_poll_timeout_minutes:
+        description: "Maximum minutes to poll when wait_for_agent_run is true."
+        required: false
+        default: "60"
 
 jobs:
   # ──────────────────────────────────────────────────────────────────────
@@ -195,37 +209,98 @@ jobs:
       - name: Launch Cursor agent
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          GH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
+          INPUT_UI_BRANCH: ${{ inputs.ui_myfinance_default_branch }}
+          WAIT_FOR_RUN: ${{ inputs.wait_for_agent_run }}
+          POLL_TIMEOUT_MIN: ${{ inputs.agent_poll_timeout_minutes }}
         run: |
           set -euo pipefail
+
+          if [ -n "${INPUT_UI_BRANCH}" ]; then
+            REF="$INPUT_UI_BRANCH"
+          else
+            REF=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/Maersk-Global/ui-myfinance" \
+              | jq -er .default_branch)
+          fi
+          echo "Using Cloud Agent startingRef: $REF"
+
           BODY=$(jq -n \
             --rawfile text /tmp/agent-prompt.txt \
             --arg repo "https://github.com/Maersk-Global/ui-myfinance" \
             --arg branch "cursor/sync-myfinance-${{ github.run_id }}" \
-            --arg ref "${{ inputs.ui_myfinance_default_branch }}" \
+            --arg ref "$REF" \
             '{
               prompt: { text: $text },
               repos: [{ url: $repo, startingRef: $ref }],
               branchName: $branch,
-              autoCreatePR: true
+              autoCreatePR: true,
+              skipReviewerRequest: true
             }')
 
           if [ -n "${{ inputs.model }}" ]; then
             BODY=$(echo "$BODY" | jq --arg m "${{ inputs.model }}" '. + { model: { id: $m } }')
           fi
 
-          RESP=$(curl -sS -X POST https://api.cursor.com/v1/agents \
+          HTTP_CODE=$(curl -sS -o /tmp/create-agent.json -w "%{http_code}" -X POST https://api.cursor.com/v1/agents \
             -u "${CURSOR_API_KEY}:" \
             -H 'Content-Type: application/json' \
             -d "$BODY")
 
-          echo "$RESP" | jq .
-          AGENT_URL=$(echo "$RESP" | jq -r '.agent.url // "unknown"')
+          jq . /tmp/create-agent.json
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
+            echo "::error::Cursor POST /v1/agents failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+          AGENT_ID=$(jq -r '.agent.id' /tmp/create-agent.json)
+          RUN_ID=$(jq -r '.run.id' /tmp/create-agent.json)
+          AGENT_URL=$(jq -r '.agent.url // "unknown"' /tmp/create-agent.json)
+
           FILE_COUNT=$(echo '${{ needs.detect-drift.outputs.changed_files }}' | jq 'length')
+
+          POLL_TIMEOUT_MIN="${POLL_TIMEOUT_MIN:-60}"
+
+          if [ "${WAIT_FOR_RUN}" = "true" ]; then
+            DEADLINE=$(($(date +%s) + POLL_TIMEOUT_MIN * 60))
+            while true; do
+              NOW=$(date +%s)
+              if [ "$NOW" -ge "$DEADLINE" ]; then
+                echo "::error::Timed out after ${POLL_TIMEOUT_MIN} minutes waiting for Cursor run $RUN_ID"
+                exit 1
+              fi
+              RUN_JSON=$(curl -sS -u "${CURSOR_API_KEY}:" \
+                "https://api.cursor.com/v1/agents/${AGENT_ID}/runs/${RUN_ID}")
+              STATUS=$(echo "$RUN_JSON" | jq -r .status)
+              echo "Cursor run status: $STATUS"
+              case "$STATUS" in
+                FINISHED)
+                  echo "Run FINISHED — if GitHub allows it, Cursor opens the PR after this point."
+                  break
+                  ;;
+                ERROR|CANCELLED|EXPIRED)
+                  echo "::error::Cursor run ended with status=$STATUS (no PR). Open the agent for logs: $AGENT_URL"
+                  exit 1
+                  ;;
+                *)
+                  sleep 30
+                  ;;
+              esac
+            done
+          else
+            echo "Not polling run status — open $AGENT_URL and wait for FINISHED to see the PR on GitHub."
+          fi
+
           {
-            echo "### Cursor agent launched"
+            echo "### Cursor agent"
             echo "- Target repo (PR opens here): **Maersk-Global/ui-myfinance**"
             echo "- Agent: $AGENT_URL"
-            echo "- Branch: \`cursor/sync-myfinance-${{ github.run_id }}\` (from \`${{ inputs.ui_myfinance_default_branch }}\`)"
-            echo "- Source SHA: \`${{ needs.detect-drift.outputs.source_sha }}\`"
+            echo "- Run: \`$RUN_ID\`"
+            echo "- Branch: \`cursor/sync-myfinance-${{ github.run_id }}\` (from \`$REF\`)"
+            echo "- Source SHA (API schemas): \`${{ needs.detect-drift.outputs.source_sha }}\`"
             echo "- Files passed in: $FILE_COUNT YAML(s)"
+            echo ""
+            echo "_PRs are created when the run completes successfully (FINISHED). If the run errors, check the agent URL above._"
           } >> "$GITHUB_STEP_SUMMARY"
