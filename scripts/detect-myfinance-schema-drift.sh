@@ -1,19 +1,61 @@
 #!/usr/bin/env bash
 # Local parity with .github/workflows/sync-myfinance-schemas.yml → job "detect-drift".
+#
+# Auth: set MAERSK_SCHEMAS_PAT to a fine-grained GitHub PAT with Contents: Read on
+# Maersk-Global/API-JSON-Schema-Definitions and Maersk-Global/ui-myfinance (HTTPS clone).
+# Or omit it and use SSH (git@github.com:...) if your git client has org access.
+#
+# Optional env:
+#   SCHEMA_SRC_DIR   — API-JSON clone directory (default /tmp/api-src-myfinance-drift)
+#   UI_SCHEMAS_DIR   — ui-myfinance sparse clone root (default /tmp/ui-src-myfinance-drift)
+#
 # Usage: run from repo root. Optional: ONLY regex as first arg (matches local schema filenames).
 set -euo pipefail
 
 ONLY="${1:-}"
-SRC_DIR="${SCHEMA_SRC_DIR:-/tmp/api-src-myfinance-drift}"
+API_DIR="${SCHEMA_SRC_DIR:-/tmp/api-src-myfinance-drift}"
+UI_DIR="${UI_SCHEMAS_DIR:-/tmp/ui-src-myfinance-drift}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-if [ ! -d "$SRC_DIR/.git" ]; then
-  echo "Cloning API-JSON-Schema-Definitions into $SRC_DIR ..." >&2
-  rm -rf "$SRC_DIR"
-  git clone --depth=1 https://github.com/Maersk-Global/API-JSON-Schema-Definitions "$SRC_DIR"
-fi
+clone_api_repo() {
+  if [ -d "$API_DIR/.git" ]; then
+    return 0
+  fi
+  echo "Cloning API-JSON-Schema-Definitions into $API_DIR ..." >&2
+  rm -rf "$API_DIR"
+  if [ -n "${MAERSK_SCHEMAS_PAT:-}" ]; then
+    git clone --depth=1 \
+      "https://x-access-token:${MAERSK_SCHEMAS_PAT}@github.com/Maersk-Global/API-JSON-Schema-Definitions" \
+      "$API_DIR"
+  else
+    git clone --depth=1 \
+      "git@github.com:Maersk-Global/API-JSON-Schema-Definitions.git" \
+      "$API_DIR"
+  fi
+}
 
-SRC="$SRC_DIR"
+clone_ui_schemas() {
+  if [ -d "$UI_DIR/.git" ]; then
+    return 0
+  fi
+  echo "Sparse-cloning ui-myfinance/schemas into $UI_DIR ..." >&2
+  rm -rf "$UI_DIR"
+  if [ -n "${MAERSK_SCHEMAS_PAT:-}" ]; then
+    git clone --depth=1 --filter=blob:none --sparse \
+      "https://x-access-token:${MAERSK_SCHEMAS_PAT}@github.com/Maersk-Global/ui-myfinance" \
+      "$UI_DIR"
+  else
+    git clone --depth=1 --filter=blob:none --sparse \
+      "git@github.com:Maersk-Global/ui-myfinance.git" \
+      "$UI_DIR"
+  fi
+  git -C "$UI_DIR" sparse-checkout set schemas
+}
+
+clone_api_repo
+clone_ui_schemas
+
+SRC="$API_DIR"
 SOURCE_SHA=$(git -C "$SRC" rev-parse HEAD)
 CHANGES='[]'
 
@@ -38,7 +80,7 @@ while IFS=$'\t' read -r remote_rel local_name; do
     continue
   fi
   remote_path="$SRC/$remote_rel"
-  local_path="schemas/$local_name"
+  local_path="$UI_DIR/schemas/$local_name"
   if [ ! -f "$remote_path" ]; then
     if [ -f "$local_path" ]; then
       CHANGES=$(echo "$CHANGES" | jq --arg r "$remote_rel" --arg l "$local_name" \
