@@ -180,8 +180,9 @@ jobs:
         run: |
           set -euo pipefail
           PROMPT=$(envsubst < .cursor/prompts/sync-myfinance-schemas.md)
-          # Write to a file — do not pass this via GITHUB_OUTPUT or ${{ }} into the
-          # next step's shell: JSON/markdown/newlines/braces break the runner script.
+          # Write to a file — do not pass the prompt via GITHUB_OUTPUT or inline
+          # workflow expressions into the next step's shell; JSON/markdown/newlines/braces
+          # break the runner script if inlined.
           printf '%s\n' "$PROMPT" > /tmp/agent-prompt.txt
 
       - name: Launch Cursor agent
