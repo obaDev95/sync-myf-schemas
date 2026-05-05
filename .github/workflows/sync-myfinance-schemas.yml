@@ -1,7 +1,9 @@
 # Required repository secrets:
 #   CURSOR_API_KEY      — Cursor Cloud Agents API key (Integrations in Cursor dashboard).
 #   MAERSK_SCHEMAS_PAT — Fine-grained GitHub PAT with Contents: Read on
-#                        Maersk-Global/API-JSON-Schema-Definitions and Maersk-Global/ui-myfinance.
+#                        Maersk-Global/API-JSON-Schema-Definitions and Contents: Read + Write on
+#                        Maersk-Global/ui-myfinance (Write is required to push the pre-staged
+#                        sync branch the Cloud Agent checks out).
 # Add with: gh secret set CURSOR_API_KEY --repo <owner/repo>
 #           gh secret set MAERSK_SCHEMAS_PAT --repo <owner/repo>
 #
@@ -36,7 +38,7 @@ on:
         required: false
         default: ""
       ui_myfinance_default_branch:
-        description: "repos[0].startingRef for ui-myfinance. Leave empty to resolve the repo default branch via the GitHub API."
+        description: "Base branch of ui-myfinance: drift is computed against its schemas/, and the sync branch is forked from it. Leave empty to use the repo default branch via the GitHub API."
         required: false
         default: ""
       wait_for_agent_run:
@@ -53,6 +55,8 @@ jobs:
   # Job 1: Deterministic pre-flight gate.
   # Clones API-JSON-Schema-Definitions (org-private) and sparse-checks out
   # ui-myfinance/schemas/, diffs tracked YAMLs, and emits a JSON change list.
+  # When drift exists and dry_run is false, pushes sync/myfinance-schemas-<sha>
+  # to ui-myfinance so the Cloud Agent never clones the API repo.
   # If nothing drifted the workflow ends here — zero Cursor tokens spent.
   # ──────────────────────────────────────────────────────────────────────
   detect-drift:
@@ -62,6 +66,9 @@ jobs:
       has_changes: ${{ steps.diff.outputs.has_changes }}
       changed_files: ${{ steps.diff.outputs.changed_files }}
       source_sha: ${{ steps.diff.outputs.source_sha }}
+      base_ref: ${{ steps.diff.outputs.base_ref }}
+      staged_branch: ${{ steps.diff.outputs.staged_branch }}
+      agent_starting_ref: ${{ steps.diff.outputs.agent_starting_ref }}
     steps:
       - uses: actions/checkout@v4
 
@@ -86,6 +93,9 @@ jobs:
         id: diff
         env:
           ONLY: ${{ inputs.only }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          INPUT_UI_BRANCH: ${{ inputs.ui_myfinance_default_branch }}
+          GH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
         run: |
           set -euo pipefail
           SRC=/tmp/api-src
@@ -177,6 +187,68 @@ jobs:
             echo "$CHANGES" | jq -r '.[] | select(.status == "deleted")  | "- `\(.local)`"'
           } >> "$GITHUB_STEP_SUMMARY"
 
+          # Base ref for ui-myfinance (fork point + dry-run agent checkout)
+          if [ -n "${INPUT_UI_BRANCH}" ]; then
+            BASE_REF="$INPUT_UI_BRANCH"
+          else
+            BASE_REF=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/Maersk-Global/ui-myfinance" \
+              | jq -er .default_branch)
+          fi
+          echo "base_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
+
+          SHORT_SHA="${SOURCE_SHA:0:7}"
+          STAGE_BRANCH="sync/myfinance-schemas-${SHORT_SHA}"
+
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "staged_branch=" >> "$GITHUB_OUTPUT"
+            echo "agent_starting_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
+            {
+              echo ""
+              echo "**Dry run:** no schema branch pushed. Cloud Agent \`startingRef\`: \`$BASE_REF\` (schemas on disk are not pre-synced)."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            rm -rf /tmp/ui-stage
+            git clone --depth=1 -b "$BASE_REF" \
+              "https://x-access-token:${GH_TOKEN}@github.com/Maersk-Global/ui-myfinance" \
+              /tmp/ui-stage
+            git -C /tmp/ui-stage config user.email "github-actions[bot]@users.noreply.github.com"
+            git -C /tmp/ui-stage config user.name "github-actions[bot]"
+            git -C /tmp/ui-stage checkout -b "$STAGE_BRANCH"
+
+            while IFS= read -r row; do
+              status=$(echo "$row" | jq -r .status)
+              remote_rel=$(echo "$row" | jq -r .remote)
+              local_name=$(echo "$row" | jq -r .local)
+              case "$status" in
+                added|modified)
+                  mkdir -p /tmp/ui-stage/schemas
+                  cp "$SRC/$remote_rel" "/tmp/ui-stage/schemas/$local_name"
+                  ;;
+                deleted)
+                  if [ -f "/tmp/ui-stage/schemas/$local_name" ]; then
+                    git -C /tmp/ui-stage rm -f "schemas/$local_name"
+                  fi
+                  ;;
+              esac
+            done < <(echo "$CHANGES" | jq -c '.[]')
+
+            git -C /tmp/ui-stage add schemas/
+            git -C /tmp/ui-stage commit -m "chore(schemas): sync myfinance YAMLs from API repo @ ${SOURCE_SHA}"
+            git -C /tmp/ui-stage remote set-url origin \
+              "https://x-access-token:${GH_TOKEN}@github.com/Maersk-Global/ui-myfinance.git"
+            git -C /tmp/ui-stage push --force-with-lease origin "$STAGE_BRANCH"
+
+            echo "staged_branch=$STAGE_BRANCH" >> "$GITHUB_OUTPUT"
+            echo "agent_starting_ref=$STAGE_BRANCH" >> "$GITHUB_OUTPUT"
+            {
+              echo ""
+              echo "**Pre-staged branch pushed:** \`$STAGE_BRANCH\` (Cloud Agent \`startingRef\`). Tip of branch includes one \`chore(schemas):\` commit; compare with \`HEAD~1\` for YAML diffs."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   # ──────────────────────────────────────────────────────────────────────
   # Job 2: Launch the Cursor Cloud Agent.
   # Only runs when detect-drift found at least one changed file.
@@ -209,22 +281,13 @@ jobs:
       - name: Launch Cursor agent
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
-          GH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
-          INPUT_UI_BRANCH: ${{ inputs.ui_myfinance_default_branch }}
           WAIT_FOR_RUN: ${{ inputs.wait_for_agent_run }}
           POLL_TIMEOUT_MIN: ${{ inputs.agent_poll_timeout_minutes }}
+          AGENT_STARTING_REF: ${{ needs.detect-drift.outputs.agent_starting_ref }}
         run: |
           set -euo pipefail
 
-          if [ -n "${INPUT_UI_BRANCH}" ]; then
-            REF="$INPUT_UI_BRANCH"
-          else
-            REF=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/Maersk-Global/ui-myfinance" \
-              | jq -er .default_branch)
-          fi
+          REF="${AGENT_STARTING_REF}"
           echo "Using Cloud Agent startingRef: $REF"
 
           # Build JSON on disk (do not pipe BODY through echo | jq — huge / odd prompts are safer
@@ -309,7 +372,7 @@ jobs:
             echo "- Target repo (PR opens here): **Maersk-Global/ui-myfinance**"
             echo "- Agent: $AGENT_URL"
             echo "- Run: \`$RUN_ID\`"
-            echo "- Branch: \`$BRANCH\` (from \`$REF\`)"
+            echo "- Branch: \`$BRANCH\` (Cursor \`startingRef\`: \`$REF\`)"
             echo "- Source SHA (API schemas): \`${{ needs.detect-drift.outputs.source_sha }}\`"
             echo "- Files passed in: $FILE_COUNT YAML(s)"
             echo ""
