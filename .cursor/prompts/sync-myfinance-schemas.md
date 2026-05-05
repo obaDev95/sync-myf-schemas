@@ -21,8 +21,6 @@ under "Unmapped files" in the PR description.
 | `schemas/myfinance-invoices-API.v1.yml`                | `codegen-invoices`                   |
 | `schemas/myfinance-invoices-API.v2.yaml`               | `codegen-invoices-v2`                |
 | `schemas/myfinance-submit-proof-of-payment-API.v1.yaml`| `codegen-proof-of-payment`           |
-| `schemas/PNC_PaymentAvailability-API.v1.yaml`          | `codegen-payment-availability`       |
-| `schemas/PNC_BankProfiles-API.v1.yaml`                 | `codegen-bank-profiles`              |
 | `schemas/myfinance-export-documents-API.v1.yml`        | `codegen-export-documents`           |
 | `schemas/myfinance-refund-request-API.v1.yaml`         | `codegen-refund-request`             |
 | `schemas/myfinance-estatements-API.v1.yml`             | `codegen-estatements`                |

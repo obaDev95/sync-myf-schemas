@@ -63,8 +63,6 @@ MAPPING=$(cat <<'MAP'
 apis/500-Maersk.com/v1/myfinance-invoices-API.v1.yml	myfinance-invoices-API.v1.yml
 apis/500-Maersk.com/v2/myfinance-invoices-API.v2.yaml	myfinance-invoices-API.v2.yaml
 apis/500-Maersk.com/v1/myfinance-submit-proof-of-payment-API.v1.yaml	myfinance-submit-proof-of-payment-API.v1.yaml
-apis/508-PaymentsAndCheckout/v1/PNC_PaymentAvailability-API.v1.yaml	PNC_PaymentAvailability-API.v1.yaml
-apis/508-PaymentsAndCheckout/v1/PNC_BankProfiles-API.v1.yaml	PNC_BankProfiles-API.v1.yaml
 apis/500-Maersk.com/v1/35-myfinance-export-documents-API.v1.yml	myfinance-export-documents-API.v1.yml
 apis/500-Maersk.com/v1/myfinance-refund-request-API.v1.yaml	myfinance-refund-request-API.v1.yaml
 apis/500-Maersk.com/v1/myfinance-estatements-API.v1.yml	myfinance-estatements-API.v1.yml
