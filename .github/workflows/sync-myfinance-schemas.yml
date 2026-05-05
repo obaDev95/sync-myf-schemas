@@ -1,3 +1,14 @@
+# Required repository secrets:
+#   CURSOR_API_KEY      — Cursor Cloud Agents API key (Integrations in Cursor dashboard).
+#   MAERSK_SCHEMAS_PAT — Fine-grained GitHub PAT with Contents: Read on
+#                        Maersk-Global/API-JSON-Schema-Definitions and Maersk-Global/ui-myfinance.
+# Add with: gh secret set CURSOR_API_KEY --repo <owner/repo>
+#           gh secret set MAERSK_SCHEMAS_PAT --repo <owner/repo>
+#
+# Verify Cursor GitHub App can access ui-myfinance (Cloud Agents need this; PAT alone is not enough):
+#   curl -sS https://api.cursor.com/v1/repositories -u "$CURSOR_API_KEY:" \
+#     | jq '.items[] | select(.url | contains("ui-myfinance"))'
+
 name: Sync myfinance schemas (Cursor agent)
 
 on:
@@ -19,8 +30,8 @@ on:
 jobs:
   # ──────────────────────────────────────────────────────────────────────
   # Job 1: Deterministic pre-flight gate.
-  # Clones the public API-JSON-Schema-Definitions repo, diffs every
-  # tracked myfinance YAML against schemas/, and emits a JSON change list.
+  # Clones API-JSON-Schema-Definitions (org-private) and sparse-checks out
+  # ui-myfinance/schemas/, diffs tracked YAMLs, and emits a JSON change list.
   # If nothing drifted the workflow ends here — zero Cursor tokens spent.
   # ──────────────────────────────────────────────────────────────────────
   detect-drift:
@@ -33,8 +44,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone public schema source
-        run: git clone --depth=1 https://github.com/Maersk-Global/API-JSON-Schema-Definitions /tmp/api-src
+      - name: Clone API schema source (org-private)
+        env:
+          GH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
+        run: |
+          git clone --depth=1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/Maersk-Global/API-JSON-Schema-Definitions" \
+            /tmp/api-src
+
+      - name: Sparse-checkout ui-myfinance/schemas
+        env:
+          GH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
+        run: |
+          git clone --depth=1 --filter=blob:none --sparse \
+            "https://x-access-token:${GH_TOKEN}@github.com/Maersk-Global/ui-myfinance" \
+            /tmp/ui-src
+          git -C /tmp/ui-src sparse-checkout set schemas
 
       - name: Compute drift
         id: diff
@@ -43,6 +68,7 @@ jobs:
         run: |
           set -euo pipefail
           SRC=/tmp/api-src
+          UI_SRC=/tmp/ui-src
           SOURCE_SHA=$(git -C "$SRC" rev-parse HEAD)
 
           # ── Mapping table ──────────────────────────────────────────
@@ -76,7 +102,7 @@ jobs:
             fi
 
             remote_path="$SRC/$remote_rel"
-            local_path="schemas/$local_name"
+            local_path="$UI_SRC/schemas/$local_name"
 
             if [ ! -f "$remote_path" ]; then
               # Remote file was removed — local schema should be deleted
