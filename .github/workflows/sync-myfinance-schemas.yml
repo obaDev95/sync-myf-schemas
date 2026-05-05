@@ -8,6 +8,9 @@
 # Verify Cursor GitHub App can access ui-myfinance (Cloud Agents need this; PAT alone is not enough):
 #   curl -sS https://api.cursor.com/v1/repositories -u "$CURSOR_API_KEY:" \
 #     | jq '.items[] | select(.url | contains("ui-myfinance"))'
+#
+# The Cloud Agent must use repos[].url = ui-myfinance. If you pass github.repository here,
+# the agent runs against this automation repo and any PR opens there — not in ui-myfinance.
 
 name: Sync myfinance schemas (Cursor agent)
 
@@ -26,6 +29,10 @@ on:
         description: "Cursor model id (leave empty for default)."
         required: false
         default: ""
+      ui_myfinance_default_branch:
+        description: "Default branch on Maersk-Global/ui-myfinance (Cloud Agent startingRef)."
+        required: false
+        default: "main"
 
 jobs:
   # ──────────────────────────────────────────────────────────────────────
@@ -192,11 +199,12 @@ jobs:
           set -euo pipefail
           BODY=$(jq -n \
             --rawfile text /tmp/agent-prompt.txt \
-            --arg repo "https://github.com/${{ github.repository }}" \
+            --arg repo "https://github.com/Maersk-Global/ui-myfinance" \
             --arg branch "cursor/sync-myfinance-${{ github.run_id }}" \
+            --arg ref "${{ inputs.ui_myfinance_default_branch }}" \
             '{
               prompt: { text: $text },
-              repos: [{ url: $repo, startingRef: "${{ github.event.repository.default_branch }}" }],
+              repos: [{ url: $repo, startingRef: $ref }],
               branchName: $branch,
               autoCreatePR: true
             }')
@@ -215,8 +223,9 @@ jobs:
           FILE_COUNT=$(echo '${{ needs.detect-drift.outputs.changed_files }}' | jq 'length')
           {
             echo "### Cursor agent launched"
+            echo "- Target repo (PR opens here): **Maersk-Global/ui-myfinance**"
             echo "- Agent: $AGENT_URL"
-            echo "- Branch: \`cursor/sync-myfinance-${{ github.run_id }}\`"
+            echo "- Branch: \`cursor/sync-myfinance-${{ github.run_id }}\` (from \`${{ inputs.ui_myfinance_default_branch }}\`)"
             echo "- Source SHA: \`${{ needs.detect-drift.outputs.source_sha }}\`"
             echo "- Files passed in: $FILE_COUNT YAML(s)"
           } >> "$GITHUB_STEP_SUMMARY"
