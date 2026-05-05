@@ -227,29 +227,41 @@ jobs:
           fi
           echo "Using Cloud Agent startingRef: $REF"
 
-          BODY=$(jq -n \
+          # Build JSON on disk (do not pipe BODY through echo | jq — huge / odd prompts are safer
+          # this way). The live /v1/agents validator rejects top-level branchName; keep the payload
+          # to prompt + repos + autoCreatePR only (omit skipReviewerRequest for older gateways).
+          jq -n \
             --rawfile text /tmp/agent-prompt.txt \
             --arg repo "https://github.com/Maersk-Global/ui-myfinance" \
             --arg ref "$REF" \
             '{
               prompt: { text: $text },
               repos: [{ url: $repo, startingRef: $ref }],
-              autoCreatePR: true,
-              skipReviewerRequest: true
-            }')
+              autoCreatePR: true
+            }' > /tmp/create-agent-body.json
 
           if [ -n "${{ inputs.model }}" ]; then
-            BODY=$(echo "$BODY" | jq --arg m "${{ inputs.model }}" '. + { model: { id: $m } }')
+            jq --arg m "${{ inputs.model }}" '. + { model: { id: $m } }' /tmp/create-agent-body.json > /tmp/create-agent-body.json.tmp
+            mv /tmp/create-agent-body.json.tmp /tmp/create-agent-body.json
           fi
+
+          jq -e . /tmp/create-agent-body.json >/dev/null
+          if jq -e 'has("branchName")' /tmp/create-agent-body.json >/dev/null 2>&1; then
+            echo "::error::Refusing to POST: body unexpectedly contains top-level branchName (would trigger Cursor validation_error)."
+            jq 'keys' /tmp/create-agent-body.json
+            exit 1
+          fi
+          echo "Create-agent POST body top-level keys: $(jq -c 'keys | sort' /tmp/create-agent-body.json)"
 
           HTTP_CODE=$(curl -sS -o /tmp/create-agent.json -w "%{http_code}" -X POST https://api.cursor.com/v1/agents \
             -u "${CURSOR_API_KEY}:" \
             -H 'Content-Type: application/json' \
-            -d "$BODY")
+            --data-binary @/tmp/create-agent-body.json)
 
           jq . /tmp/create-agent.json
           if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
             echo "::error::Cursor POST /v1/agents failed with HTTP $HTTP_CODE"
+            echo "Request top-level keys (for support / debugging): $(jq -c 'keys | sort' /tmp/create-agent-body.json)"
             exit 1
           fi
 
