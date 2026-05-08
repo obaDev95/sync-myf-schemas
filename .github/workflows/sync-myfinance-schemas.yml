@@ -3,7 +3,8 @@
 #   MAERSK_SCHEMAS_PAT — Fine-grained GitHub PAT with Contents: Read on
 #                        Maersk-Global/API-JSON-Schema-Definitions and Contents: Read + Write on
 #                        Maersk-Global/ui-myfinance (Write is required to push the pre-staged
-#                        sync branch the Cloud Agent checks out).
+#                        sync branch the Cloud Agent checks out, and for split-into-prs to push
+#                        child branches and open PRs via gh — include Pull requests: Write on ui-myfinance).
 # Add with: gh secret set CURSOR_API_KEY --repo <owner/repo>
 #           gh secret set MAERSK_SCHEMAS_PAT --repo <owner/repo>
 #
@@ -19,34 +20,60 @@
 #
 # PR creation: autoCreatePR opens a GitHub PR only after the Cloud Agent run reaches FINISHED.
 # If the run ends in ERROR (wrong startingRef, push denied, etc.), no PR appears — check the agent URL.
+#
+# When split_into_pr_per_schema is true (and schema is "(all)", non–dry-run, staged branch exists),
+# autoCreatePR is false and job split-into-prs opens an umbrella PR (default <- staged branch)
+# plus one PR per Conventional Commit scope (staged <- child branch) using cherry-picks.
 
 name: Sync myfinance schemas (Cursor agent)
 
 on:
   workflow_dispatch:
     inputs:
-      only:
-        description: "Optional regex to limit scope (e.g. 'invoices'). Matched against local schema filenames. Empty = all tracked files."
-        required: false
-        default: ""
+      schema:
+        description: "Drifted schema YAML to process. Pick '(all)' to adapt every drifted file in one run."
+        type: choice
+        default: "(all)"
+        options:
+          - "(all)"
+          - myfinance-invoices-API.v1.yml
+          - myfinance-invoices-API.v2.yaml
+          - myfinance-submit-proof-of-payment-API.v1.yaml
+          - myfinance-export-documents-API.v1.yml
+          - myfinance-refund-request-API.v1.yaml
+          - myfinance-estatements-API.v1.yml
+          - myfinance-workflows-API.v1.yaml
+      split_into_pr_per_schema:
+        description: "Open one PR per drifted schema (umbrella + N children). Ignored when 'schema' is not '(all)'. Same agent token cost; PRs split deterministically afterwards."
+        type: boolean
+        default: false
       dry_run:
-        description: "If true, the agent only reports what it would change."
+        description: "Skip codegen and PR creation. The agent only commits SYNC_REPORT.md describing what it would change."
         type: boolean
         default: false
       model:
-        description: "Cursor model id (leave empty for default)."
-        required: false
-        default: ""
-      ui_myfinance_default_branch:
-        description: "Base branch of ui-myfinance: drift is computed against its schemas/, and the sync branch is forked from it. Leave empty to use the repo default branch via the GitHub API."
+        description: "Cursor cloud-agent model. Pick '(default)' to use the org default."
+        type: choice
+        default: claude-4.5-opus-high
+        options:
+          - "(default)"
+          - claude-4.5-opus-high
+          - claude-4.5-sonnet
+          - claude-4-opus-thinking
+          - claude-4-sonnet-thinking
+          - composer-2
+          - gpt-5-codex-high
+          - o3
+      base_branch_override:
+        description: "Override the ui-myfinance branch the sync forks from. Leave empty to use that repo's default branch."
         required: false
         default: ""
       wait_for_agent_run:
-        description: "Poll until the Cursor run finishes. PR is created only after status FINISHED; enable this to catch ERROR runs before the job exits."
+        description: "Block this workflow until the cloud agent finishes, so failures show up in this run instead of silently."
         type: boolean
         default: true
       agent_poll_timeout_minutes:
-        description: "Maximum minutes to poll when wait_for_agent_run is true."
+        description: "Maximum wait when 'wait_for_agent_run' is on. Typical successful runs finish in 10-25 minutes."
         required: false
         default: "60"
 
@@ -65,6 +92,7 @@ jobs:
     outputs:
       has_changes: ${{ steps.diff.outputs.has_changes }}
       changed_files: ${{ steps.diff.outputs.changed_files }}
+      selected_schemas: ${{ steps.diff.outputs.selected_schemas }}
       source_sha: ${{ steps.diff.outputs.source_sha }}
       base_ref: ${{ steps.diff.outputs.base_ref }}
       staged_branch: ${{ steps.diff.outputs.staged_branch }}
@@ -92,15 +120,28 @@ jobs:
       - name: Compute drift
         id: diff
         env:
-          ONLY: ${{ inputs.only }}
+          SCHEMA_INPUT: ${{ inputs.schema }}
           DRY_RUN: ${{ inputs.dry_run }}
-          INPUT_UI_BRANCH: ${{ inputs.ui_myfinance_default_branch }}
+          INPUT_UI_BRANCH: ${{ inputs.base_branch_override }}
           GH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
         run: |
           set -euo pipefail
           SRC=/tmp/api-src
           UI_SRC=/tmp/ui-src
           SOURCE_SHA=$(git -C "$SRC" rev-parse HEAD)
+
+          slug_for_local() {
+            case "$1" in
+              myfinance-invoices-API.v1.yml) echo invoices-v1 ;;
+              myfinance-invoices-API.v2.yaml) echo invoices-v2 ;;
+              myfinance-submit-proof-of-payment-API.v1.yaml) echo submit-proof-of-payment ;;
+              myfinance-export-documents-API.v1.yml) echo export-documents ;;
+              myfinance-refund-request-API.v1.yaml) echo refund-request ;;
+              myfinance-estatements-API.v1.yml) echo estatements ;;
+              myfinance-workflows-API.v1.yaml) echo workflows ;;
+              *) echo shared ;;
+            esac
+          }
 
           # ── Mapping table ──────────────────────────────────────────
           # Each line: <remote path relative to repo root> <TAB> <local filename in schemas/>
@@ -125,8 +166,8 @@ jobs:
             remote_rel=$(echo "$remote_rel" | xargs)
             local_name=$(echo "$local_name" | xargs)
 
-            # Honour the ONLY filter (matched against local filename)
-            if [ -n "$ONLY" ] && ! echo "$local_name" | grep -Eq "$ONLY"; then
+            # Honour schema filter (exact local filename) when not "(all)"
+            if [ "$SCHEMA_INPUT" != "(all)" ] && [ "$local_name" != "$SCHEMA_INPUT" ]; then
               continue
             fi
 
@@ -154,6 +195,7 @@ jobs:
 
           if [ "$TOTAL" -eq 0 ]; then
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo 'selected_schemas=[]' >> "$GITHUB_OUTPUT"
             {
               echo "## No schema drift detected"
               echo ""
@@ -164,9 +206,18 @@ jobs:
             exit 0
           fi
 
+          SELECTED_SCHEMAS='[]'
+          while IFS= read -r row; do
+            local_name=$(echo "$row" | jq -r .local)
+            slug=$(slug_for_local "$local_name")
+            SELECTED_SCHEMAS=$(echo "$SELECTED_SCHEMAS" | jq --arg s "$slug" '. + [$s]')
+          done < <(echo "$CHANGES" | jq -c '.[]')
+          SELECTED_SCHEMAS=$(echo "$SELECTED_SCHEMAS" | jq 'unique')
+
           echo "has_changes=true" >> "$GITHUB_OUTPUT"
           echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
           echo "changed_files=$(echo "$CHANGES" | jq -c '.')" >> "$GITHUB_OUTPUT"
+          echo "selected_schemas=$(echo "$SELECTED_SCHEMAS" | jq -c '.')" >> "$GITHUB_OUTPUT"
 
           ADDED=$(echo "$CHANGES"   | jq '[.[] | select(.status == "added")]   | length')
           MODIFIED=$(echo "$CHANGES" | jq '[.[] | select(.status == "modified")] | length')
@@ -176,6 +227,10 @@ jobs:
             echo "## Schema drift detected"
             echo ""
             echo "Source SHA: \`$SOURCE_SHA\`"
+            echo ""
+            echo "**Schema scope:** \`$SCHEMA_INPUT\`"
+            echo ""
+            echo "**Slugs for split / commits:** \`$(echo "$SELECTED_SCHEMAS" | jq -c .)\`"
             echo ""
             echo "**Added ($ADDED)**"
             echo "$CHANGES" | jq -r '.[] | select(.status == "added")   | "- `\(.local)` ← \(.remote)"'
@@ -260,12 +315,16 @@ jobs:
     runs-on: ubuntu-latest
     needs: detect-drift
     if: needs.detect-drift.outputs.has_changes == 'true'
+    outputs:
+      agent_branch: ${{ steps.launch.outputs.agent_branch }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Build prompt
         env:
-          ONLY: ${{ inputs.only }}
+          SCHEMA: ${{ inputs.schema }}
+          SPLIT_INTO_PR_PER_SCHEMA: ${{ inputs.split_into_pr_per_schema }}
+          SELECTED_SCHEMAS: ${{ needs.detect-drift.outputs.selected_schemas }}
           DRY_RUN: ${{ inputs.dry_run }}
           ACTOR: ${{ github.actor }}
           CHANGED_FILES: ${{ needs.detect-drift.outputs.changed_files }}
@@ -279,16 +338,31 @@ jobs:
           printf '%s\n' "$PROMPT" > /tmp/agent-prompt.txt
 
       - name: Launch Cursor agent
+        id: launch
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           WAIT_FOR_RUN: ${{ inputs.wait_for_agent_run }}
           POLL_TIMEOUT_MIN: ${{ inputs.agent_poll_timeout_minutes }}
           AGENT_STARTING_REF: ${{ needs.detect-drift.outputs.agent_starting_ref }}
+          SPLIT_PR: ${{ inputs.split_into_pr_per_schema }}
+          SCHEMA_IN: ${{ inputs.schema }}
+          DRY_RUN_IN: ${{ inputs.dry_run }}
+          STAGED_IN: ${{ needs.detect-drift.outputs.staged_branch }}
+          MODEL_INPUT: ${{ inputs.model }}
         run: |
           set -euo pipefail
 
           REF="${AGENT_STARTING_REF}"
           echo "Using Cloud Agent startingRef: $REF"
+
+          AUTO_CREATE_PR=true
+          if [ "${SPLIT_PR}" = "true" ] && [ "${SCHEMA_IN}" = "(all)" ] && [ "${DRY_RUN_IN}" != "true" ] && [ -n "${STAGED_IN}" ]; then
+            AUTO_CREATE_PR=false
+            echo "split_into_pr_per_schema: disabling Cursor autoCreatePR (split-into-prs will open PRs)."
+          fi
+
+          ACP_JSON=true
+          [ "$AUTO_CREATE_PR" = "false" ] && ACP_JSON=false
 
           # Build JSON on disk (do not pipe BODY through echo | jq — huge / odd prompts are safer
           # this way). The live /v1/agents validator rejects top-level branchName; keep the payload
@@ -297,14 +371,15 @@ jobs:
             --rawfile text /tmp/agent-prompt.txt \
             --arg repo "https://github.com/Maersk-Global/ui-myfinance" \
             --arg ref "$REF" \
+            --argjson acp "$ACP_JSON" \
             '{
               prompt: { text: $text },
               repos: [{ url: $repo, startingRef: $ref }],
-              autoCreatePR: true
+              autoCreatePR: $acp
             }' > /tmp/create-agent-body.json
 
-          if [ -n "${{ inputs.model }}" ]; then
-            jq --arg m "${{ inputs.model }}" '. + { model: { id: $m } }' /tmp/create-agent-body.json > /tmp/create-agent-body.json.tmp
+          if [ "${MODEL_INPUT}" != "(default)" ] && [ -n "${MODEL_INPUT}" ]; then
+            jq --arg m "${MODEL_INPUT}" '. + { model: { id: $m } }' /tmp/create-agent-body.json > /tmp/create-agent-body.json.tmp
             mv /tmp/create-agent-body.json.tmp /tmp/create-agent-body.json
           fi
 
@@ -331,7 +406,11 @@ jobs:
           AGENT_ID=$(jq -r '.agent.id' /tmp/create-agent.json)
           RUN_ID=$(jq -r '.run.id' /tmp/create-agent.json)
           AGENT_URL=$(jq -r '.agent.url // "unknown"' /tmp/create-agent.json)
-          BRANCH=$(jq -r '.agent.branchName // "auto-generated"' /tmp/create-agent.json)
+          BRANCH=$(jq -r '.agent.branchName // empty' /tmp/create-agent.json)
+          if [ -z "$BRANCH" ] || [ "$BRANCH" = "null" ]; then
+            BRANCH="auto-generated"
+          fi
+          echo "agent_branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
           FILE_COUNT=$(echo '${{ needs.detect-drift.outputs.changed_files }}' | jq 'length')
 
@@ -351,7 +430,11 @@ jobs:
               echo "Cursor run status: $STATUS"
               case "$STATUS" in
                 FINISHED)
-                  echo "Run FINISHED — if GitHub allows it, Cursor opens the PR after this point."
+                  if [ "$AUTO_CREATE_PR" = "true" ]; then
+                    echo "Run FINISHED — if GitHub allows it, Cursor opens the PR after this point."
+                  else
+                    echo "Run FINISHED — split-into-prs job will open umbrella + per-scope PRs."
+                  fi
                   break
                   ;;
                 ERROR|CANCELLED|EXPIRED)
@@ -365,6 +448,9 @@ jobs:
             done
           else
             echo "Not polling run status — open $AGENT_URL and wait for FINISHED to see the PR on GitHub."
+            if [ "${SPLIT_PR}" = "true" ] && [ "${SCHEMA_IN}" = "(all)" ] && [ "${DRY_RUN_IN}" != "true" ] && [ -n "${STAGED_IN}" ]; then
+              echo "::warning::split_into_pr_per_schema is ignored when wait_for_agent_run is false — run must finish before deterministic PR split."
+            fi
           fi
 
           {
@@ -375,6 +461,191 @@ jobs:
             echo "- Branch: \`$BRANCH\` (Cursor \`startingRef\`: \`$REF\`)"
             echo "- Source SHA (API schemas): \`${{ needs.detect-drift.outputs.source_sha }}\`"
             echo "- Files passed in: $FILE_COUNT YAML(s)"
+            echo "- autoCreatePR: \`$AUTO_CREATE_PR\`"
             echo ""
-            echo "_PRs are created when the run completes successfully (FINISHED). If the run errors, check the agent URL above._"
+            echo "_When autoCreatePR is true, PRs are created when the run completes successfully (FINISHED). If the run errors, check the agent URL above._"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Job 3: Deterministic PR split (no extra LLM). Cherry-picks agent commits
+  # grouped by Conventional Commit scope onto child branches and opens PRs
+  # with base = staged sync branch. Also ensures an umbrella PR exists:
+  # default_branch <- staged_branch (schema YAML only on staged tip).
+  # ──────────────────────────────────────────────────────────────────────
+  split-into-prs:
+    name: Split agent work into per-schema PRs
+    runs-on: ubuntu-latest
+    needs: [detect-drift, launch-agent]
+    if: |
+      needs.detect-drift.outputs.has_changes == 'true' &&
+      needs.launch-agent.result == 'success' &&
+      inputs.split_into_pr_per_schema == true &&
+      inputs.wait_for_agent_run == true &&
+      inputs.schema == '(all)' &&
+      inputs.dry_run == false &&
+      needs.detect-drift.outputs.staged_branch != ''
+    env:
+      GH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
+    steps:
+      - name: Cherry-pick by scope and open PRs
+        shell: bash
+        env:
+          STAGED_BRANCH: ${{ needs.detect-drift.outputs.staged_branch }}
+          AGENT_BRANCH: ${{ needs.launch-agent.outputs.agent_branch }}
+          BASE_REF: ${{ needs.detect-drift.outputs.base_ref }}
+          SOURCE_SHA: ${{ needs.detect-drift.outputs.source_sha }}
+          SELECTED_SCHEMAS: ${{ needs.detect-drift.outputs.selected_schemas }}
+        run: |
+          set -euo pipefail
+
+          scope_from_subject() {
+            local sub="$1"
+            if [[ "$sub" =~ ^(feat|fix|test|chore|refactor|docs|style|perf|ci|build)\(([^)]+)\): ]]; then
+              echo "${BASH_REMATCH[2]}"
+              return 0
+            fi
+            echo "shared"
+            echo "::warning::Commit subject has no Conventional scope; treating as shared: $sub" >&2
+            return 0
+          }
+
+          REPO="Maersk-Global/ui-myfinance"
+          SHORT_SHA="${SOURCE_SHA:0:7}"
+
+          if [ -z "${AGENT_BRANCH}" ] || [ "$AGENT_BRANCH" = "auto-generated" ]; then
+            echo "::error::Agent branch name missing or unknown; cannot split PRs."
+            exit 1
+          fi
+
+          rm -rf /tmp/ui-split
+          git clone --no-single-branch \
+            "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" \
+            /tmp/ui-split
+          cd /tmp/ui-split
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
+          git fetch origin "${STAGED_BRANCH}" "${AGENT_BRANCH}"
+          if ! git rev-parse "origin/${STAGED_BRANCH}" >/dev/null 2>&1; then
+            echo "::error::Staged branch origin/${STAGED_BRANCH} not found after fetch."
+            exit 1
+          fi
+          if ! git rev-parse "origin/${AGENT_BRANCH}" >/dev/null 2>&1; then
+            echo "::error::Agent branch origin/${AGENT_BRANCH} not found after fetch."
+            exit 1
+          fi
+
+          STAGED_SHA=$(git rev-parse "origin/${STAGED_BRANCH}")
+          AGENT_SHA=$(git rev-parse "origin/${AGENT_BRANCH}")
+
+          echo "Staged: ${STAGED_BRANCH} @ ${STAGED_SHA}"
+          echo "Agent:  ${AGENT_BRANCH} @ ${AGENT_SHA}"
+
+          # ── Umbrella PR: BASE_REF <- STAGED_BRANCH (schema sync only until children merge)
+          EXISTING=$(gh pr list -R "$REPO" --base "$BASE_REF" --head "$STAGED_BRANCH" --state open --json number -q '.[0].number // empty' || true)
+          if [ -z "${EXISTING}" ]; then
+            printf '%s\n' \
+              "Automated schema sync from API-JSON-Schema-Definitions @ \`${SOURCE_SHA}\`." \
+              "" \
+              "Child PRs (one per Conventional Commit scope) target branch \`${STAGED_BRANCH}\` after the Cloud Agent run when **split_into_pr_per_schema** is enabled." \
+              "" \
+              "**Slugs in this run:** \`${SELECTED_SCHEMAS}\`" \
+              > /tmp/umbrella-body.md
+            gh pr create -R "$REPO" \
+              --base "$BASE_REF" \
+              --head "$STAGED_BRANCH" \
+              --title "chore(schemas): sync myfinance YAMLs from API @ ${SOURCE_SHA}" \
+              --body-file /tmp/umbrella-body.md
+          else
+            echo "Umbrella PR already exists: #${EXISTING}"
+          fi
+
+          # ── Collect agent commits (exclude merges)
+          mapfile -t COMMITS < <(git rev-list --no-merges --reverse "${STAGED_SHA}..${AGENT_SHA}")
+
+          if [ "${#COMMITS[@]}" -eq 0 ]; then
+            echo "No commits between staged tip and agent tip — nothing to cherry-pick."
+            exit 0
+          fi
+
+          # Group commit SHAs by scope (order within each scope = chronological)
+          GROUPS='{}'
+          for c in "${COMMITS[@]}"; do
+            sub=$(git log -1 --format=%s "$c")
+            sc=$(scope_from_subject "$sub")
+            GROUPS=$(echo "$GROUPS" | jq --arg s "$sc" --arg h "$c" '.[$s] = (.[$s] // []) + [$h]')
+          done
+
+          mapfile -t SCOPES < <(echo "$GROUPS" | jq -r 'keys[]')
+
+          FAILURES=0
+          for sc in "${SCOPES[@]}"; do
+            [ -z "$sc" ] && continue
+            branch_safe=$(echo "$sc" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g' | cut -c1-60)
+            CHILD="sync/myfinance-ui-${SHORT_SHA}-${branch_safe}"
+
+            mapfile -t SHA_LIST < <(echo "$GROUPS" | jq -r --arg s "$sc" '.[$s][]')
+
+            echo ""
+            echo "=== Scope: $sc -> branch $CHILD (${#SHA_LIST[@]} commits) ==="
+
+            if [ "${#SHA_LIST[@]}" -eq 0 ]; then
+              echo "Skipping empty scope list."
+              continue
+            fi
+
+            git checkout -B "$CHILD" "origin/${STAGED_BRANCH}"
+            ok=true
+            for sha in "${SHA_LIST[@]}"; do
+              [ -z "$sha" ] && continue
+              if ! git cherry-pick "$sha"; then
+                echo "::error::Cherry-pick failed for scope=$sc commit=$sha — resolve manually or merge umbrella PR."
+                git cherry-pick --abort 2>/dev/null || true
+                ok=false
+                FAILURES=$((FAILURES + 1))
+                break
+              fi
+            done
+
+            if [ "$ok" != true ]; then
+              git checkout "origin/${STAGED_BRANCH}"
+              git branch -D "$CHILD" 2>/dev/null || true
+              continue
+            fi
+
+            git push --force-with-lease "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$CHILD"
+
+            PR_TITLE="feat(${sc}): myfinance UI sync (API @ ${SHORT_SHA})"
+            if [ "$sc" = "shared" ]; then
+              PR_TITLE="chore(shared): cross-cutting myfinance UI sync (API @ ${SHORT_SHA})"
+            fi
+
+            COMMIT_LINE=$(printf '%s ' "${SHA_LIST[@]}")
+
+            printf '%s\n' \
+              "Automated split from Cloud Agent branch \`${AGENT_BRANCH}\`." \
+              "" \
+              "- **Scope:** \`${sc}\`" \
+              "- **API source SHA:** \`${SOURCE_SHA}\`" \
+              "- **Commits:** ${COMMIT_LINE}" \
+              "" \
+              "_Merge after review. If this PR conflicts with another scope PR, merge \`${STAGED_BRANCH}\` (umbrella) or combine changes manually._" \
+              > /tmp/child-body.md
+            gh pr create -R "$REPO" \
+              --base "$STAGED_BRANCH" \
+              --head "$CHILD" \
+              --title "$PR_TITLE" \
+              --body-file /tmp/child-body.md
+          done
+
+          if [ "$FAILURES" -gt 0 ]; then
+            echo "::warning::$FAILURES scope branch(es) failed cherry-pick; see logs above."
+          fi
+
+          {
+            echo "## PR split (deterministic)"
+            echo "- Umbrella: \`$BASE_REF\` <- \`$STAGED_BRANCH\`"
+            echo "- Children: \`$STAGED_BRANCH\` <- \`sync/myfinance-ui-${SHORT_SHA}-*\`"
+            echo "- Agent branch: \`${AGENT_BRANCH}\`"
+            echo "- Scopes: $(printf '%s, ' "${SCOPES[@]}")"
           } >> "$GITHUB_STEP_SUMMARY"
