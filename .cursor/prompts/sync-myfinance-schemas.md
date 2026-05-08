@@ -5,11 +5,13 @@ for it in this environment.
 
 ## Inputs (from the launching workflow)
 
-- ONLY filter:    ${ONLY}            # empty = all myfinance files
-- DRY_RUN:        ${DRY_RUN}          # "true" => report only (see Dry-run gate below)
-- Triggered by:   ${ACTOR}
-- CHANGED_FILES:  ${CHANGED_FILES}   # JSON array — each entry is { "remote": "<path in API repo>", "local": "<path in schemas/>", "status": "added|modified|deleted" }
-- SOURCE_SHA:     ${SOURCE_SHA}      # commit of the API repo CI synced from
+- SCHEMA:                    ${SCHEMA}                    # `(all)` or one local schema filename under `schemas/`
+- SPLIT_INTO_PR_PER_SCHEMA:  ${SPLIT_INTO_PR_PER_SCHEMA}  # `true` when CI will split your commits into one PR per Conventional Commit scope after the run (see Commit rules below)
+- SELECTED_SCHEMAS:          ${SELECTED_SCHEMAS}          # JSON array of schema slugs for drifted files (e.g. `["invoices-v1","estatements"]`) — use these as commit scopes when split is enabled
+- DRY_RUN:                   ${DRY_RUN}                   # `true` => report only (see Dry-run gate below)
+- Triggered by:              ${ACTOR}
+- CHANGED_FILES:             ${CHANGED_FILES}             # JSON array — each entry is `{ "remote": "<path in API repo>", "local": "<path in schemas/>", "status": "added|modified|deleted" }`
+- SOURCE_SHA:                ${SOURCE_SHA}                # commit of the API repo CI synced from
 
 ## Hard rules
 
@@ -42,6 +44,23 @@ You are on the **default base branch** with **no** pre-applied schema sync commi
 tree’s `schemas/` are unchanged. **Do not** run codegen or change UI code. Produce only
 `SYNC_REPORT.md` (see below) and commit **that file alone**.
 
+## Schema slug reference (for `SPLIT_INTO_PR_PER_SCHEMA=true`)
+
+Use these **exact** scopes in commit messages when split mode is on. They must match
+`SELECTED_SCHEMAS` for the files you touch in each commit.
+
+| Local schema file (under `schemas/`) | Slug |
+|--------------------------------------|------|
+| `myfinance-invoices-API.v1.yml` | `invoices-v1` |
+| `myfinance-invoices-API.v2.yaml` | `invoices-v2` |
+| `myfinance-submit-proof-of-payment-API.v1.yaml` | `submit-proof-of-payment` |
+| `myfinance-export-documents-API.v1.yml` | `export-documents` |
+| `myfinance-refund-request-API.v1.yaml` | `refund-request` |
+| `myfinance-estatements-API.v1.yml` | `estatements` |
+| `myfinance-workflows-API.v1.yaml` | `workflows` |
+
+Cross-cutting changes (shared util, barrel file, or a single edit that clearly serves more than one schema slug above) must use scope **`shared`**: `chore(shared): …` or `feat(shared): …` as appropriate.
+
 ## Schema → codegen script mapping
 
 Use this table to determine which `npm run codegen-*` script to run for each
@@ -65,6 +84,8 @@ under "Unmapped files" in the PR description.
 **Do NOT re-enumerate the API repo.** The workflow's `detect-drift` job
 already diffed it against `schemas/` and gave you the exact file
 list with statuses. Parse CHANGED_FILES as JSON and use it directly.
+
+When `SCHEMA` is not `(all)`, CHANGED_FILES will contain only that one file (if it drifted).
 
 ### 2. Dry-run gate
 
@@ -165,19 +186,36 @@ leave a `// TODO(cursor-sync):` comment and call it out in the PR description.
 Use logical chunks with Conventional Commits:
 
 - **Do not** add another `chore(schemas): sync myfinance YAMLs from API repo @ …` commit — CI already pushed that on your branch.
+
+**When `SPLIT_INTO_PR_PER_SCHEMA` is `true`**
+
+Every commit subject **must** be `type(scope): description` where `type` is one of
+`feat|fix|test|chore|refactor|docs|style|perf|ci|build` and `scope` is either:
+
+- one of the slugs from **Schema slug reference** above (matching the schema file that commit primarily concerns), or
+- `shared` for cross-cutting work.
+
+Examples: `feat(invoices-v1): adapt invoices table to new fields`, `test(estatements): update fixtures`, `chore(shared): fix shared date util used by invoices and estatements`.
+
+**When `SPLIT_INTO_PR_PER_SCHEMA` is not `true`** (single combined PR)
+
+Use area-style scopes as before:
+
 - `feat(<area>): adapt <area> to schema changes` (one per affected area)
 - `test(<area>): update fixtures for schema changes` (if needed)
 
 ### 7. PR body
 
-The PR will be opened automatically by the API (`autoCreatePR: true`). In the
-PR body, include:
+When Cursor opens the PR automatically (`autoCreatePR: true` — the default when split mode is off), include:
 
 - Source commit SHA: `${SOURCE_SHA}`.
 - The three file sets (ADDED / MODIFIED / DELETED).
 - The codegen script invocations you ran (or "none — dry run" if applicable).
+- **Scopes used** — list every Conventional Commit scope you used (`invoices-v1`, `shared`, etc.) so reviewers and automation can audit split mode.
 - **Renamed properties** table: `oldName | newName | files touched`.
 - **New properties surfaced** table: `property | UI surface(s) | rationale`.
 - **Removed properties** list.
 - Any unmapped files or `TODO(cursor-sync)` comments left in the diff.
 - If the run aborted per Hard rules, say so prominently at the top.
+
+When split mode is on, Cursor does not auto-create a single combined PR; CI opens an umbrella PR plus one PR per scope from your commits. Still assemble the sections above for reviewers (Cursor PR draft, commit message bodies, or any description field available). At minimum, list **Scopes used** so reviewers can confirm scopes match the slug table.
