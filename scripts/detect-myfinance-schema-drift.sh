@@ -13,11 +13,16 @@
 #                      ui-myfinance (requires MAERSK_SCHEMAS_PAT with Write, or SSH write).
 #   UI_BASE_BRANCH   — Base branch for staging (default: resolve via `gh api` if `gh` is installed)
 #   UI_STAGE_DIR     — Full clone used for staging only (default /tmp/ui-stage-myfinance-drift)
+#   SCHEMA           — Exact local schema filename under schemas/ (e.g. myfinance-invoices-API.v1.yml).
+#                      When set, only that row from the mapping is considered (mirrors workflow `schema` input).
 #
-# Usage: run from repo root. Optional: ONLY regex as first arg (matches local schema filenames).
+# Usage: run from repo root.
+#   Optional first arg: ONLY — extended regex matched against local schema filenames (power-user;
+#   ignored for a row when SCHEMA is set).
 set -euo pipefail
 
 ONLY="${1:-}"
+SCHEMA_FILE="${SCHEMA:-}"
 API_DIR="${SCHEMA_SRC_DIR:-/tmp/api-src-myfinance-drift}"
 UI_DIR="${UI_SCHEMAS_DIR:-/tmp/ui-src-myfinance-drift}"
 UI_STAGE_DIR="${UI_STAGE_DIR:-/tmp/ui-stage-myfinance-drift}"
@@ -154,7 +159,11 @@ cd "$REPO_ROOT"
 while IFS=$'\t' read -r remote_rel local_name; do
   remote_rel=$(echo "$remote_rel" | xargs)
   local_name=$(echo "$local_name" | xargs)
-  if [ -n "$ONLY" ] && ! echo "$local_name" | grep -Eq "$ONLY"; then
+  if [ -n "$SCHEMA_FILE" ]; then
+    if [ "$local_name" != "$SCHEMA_FILE" ]; then
+      continue
+    fi
+  elif [ -n "$ONLY" ] && ! echo "$local_name" | grep -Eq "$ONLY"; then
     continue
   fi
   remote_path="$SRC/$remote_rel"
