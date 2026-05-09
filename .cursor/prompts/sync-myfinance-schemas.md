@@ -8,7 +8,7 @@ for it in this environment.
 - SCHEMA:                    ${SCHEMA}                    # `(all)` or one local schema filename under `schemas/`
 - SPLIT_INTO_PR_PER_SCHEMA:  ${SPLIT_INTO_PR_PER_SCHEMA}  # `true` when CI will split your commits into one PR per Conventional Commit scope after the run (see Commit rules below)
 - SELECTED_SCHEMAS:          ${SELECTED_SCHEMAS}          # JSON array of schema slugs for drifted files (e.g. `["invoices-v1","estatements"]`) — use these as commit scopes when split is enabled
-- DRY_RUN:                   ${DRY_RUN}                   # `true` => report only (see Dry-run gate below)
+- DRY_RUN:                   ${DRY_RUN}                   # `true` in CI means the Cloud Agent is **not** launched; drift + planned codegen are in the GitHub Actions summary and `sync-myfinance-dry-run-report` artifact only (no `SYNC_REPORT.md`, no ui-myfinance commits)
 - Triggered by:              ${ACTOR}
 - CHANGED_FILES:             ${CHANGED_FILES}             # JSON array — each entry is `{ "remote": "<path in API repo>", "local": "<path in schemas/>", "status": "added|modified|deleted" }`
 - SOURCE_SHA:                ${SOURCE_SHA}                # commit of the API repo CI synced from
@@ -40,9 +40,9 @@ git diff HEAD~1 HEAD -- schemas/<filename>
 
 ### When `DRY_RUN` is `true`
 
-You are on the **default base branch** with **no** pre-applied schema sync commit. The working
-tree’s `schemas/` are unchanged. **Do not** run codegen or change UI code. Produce only
-`SYNC_REPORT.md` (see below) and commit **that file alone**.
+CI **does not launch** this agent and does **not** create `SYNC_REPORT.md` or any commit in `ui-myfinance`. Use the workflow run’s **Dry-run report** job: step summary plus artifact `sync-myfinance-dry-run-report` for drift tables and planned `npm run codegen-*` commands. If you are reading this prompt outside that path (manual agent), treat as a normal run regarding branch state unless you have been instructed otherwise.
+
+Do **not** run codegen, change UI code, push, or open a PR unless an operator explicitly asked for a non–dry-run run.
 
 ## Schema slug reference (for `SPLIT_INTO_PR_PER_SCHEMA=true`)
 
@@ -64,7 +64,7 @@ Cross-cutting changes (shared util, barrel file, or a single edit that clearly s
 ## Schema → codegen script mapping
 
 Use this table to determine which `npm run codegen-*` script to run for each
-changed local schema file (skip entirely when `DRY_RUN=true`). If a changed file is not in this table, list it
+changed local schema file. In CI, when `DRY_RUN=true`, this agent is not launched and the workflow lists planned scripts in the dry-run summary/artifact instead. If you run with `DRY_RUN=true` manually, skip codegen. If a changed file is not in this table, list it
 under "Unmapped files" in the PR description.
 
 | Local schema file                                      | npm script                           |
@@ -87,18 +87,13 @@ list with statuses. Parse CHANGED_FILES as JSON and use it directly.
 
 When `SCHEMA` is not `(all)`, CHANGED_FILES will contain only that one file (if it drifted).
 
-### 2. Dry-run gate
+### 2. Dry-run (CI vs agent)
 
-If `DRY_RUN=true`: write a markdown report to `SYNC_REPORT.md` listing:
+In **GitHub Actions**, `DRY_RUN=true` means there is **no** Cloud Agent step: drift, ADDED/MODIFIED/DELETED, and planned `npm run codegen-*` commands are emitted in the **Dry-run report** job (workflow step summary + artifact `sync-myfinance-dry-run-report`). Do not add `SYNC_REPORT.md` or any other file to `ui-myfinance` for dry-run.
 
-- The three file sets (ADDED / MODIFIED / DELETED) from CHANGED_FILES.
-- The per-file codegen scripts you **would** run (normal run only).
-- The UI changes you **would** apply (per the contract in step 5).
+If you are executing this prompt **manually** with `DRY_RUN=true`, still **do not** invent a repo report file unless operators ask: prefer pasting the same sections into the PR or ticket. Do not run codegen or edit product code until dry-run is lifted.
 
-**Commit only `SYNC_REPORT.md`** as the single additional commit on this branch. Do not modify
-`schemas/`, generated clients, application code, or tests. **Stop** after that commit.
-
-### 3. Run codegen scripts (skip when `DRY_RUN=true`)
+### 3. Run codegen scripts (skip when this agent was skipped for CI dry-run, or when `DRY_RUN=true` manually)
 
 For each changed local schema file in CHANGED_FILES, look up the matching `npm run codegen-*`
 command from the mapping table above and run it. If a file has no matching
@@ -210,7 +205,7 @@ When Cursor opens the PR automatically (`autoCreatePR: true` — the default whe
 
 - Source commit SHA: `${SOURCE_SHA}`.
 - The three file sets (ADDED / MODIFIED / DELETED).
-- The codegen script invocations you ran (or "none — dry run" if applicable).
+- The codegen script invocations you ran (CI **dry_run** uses the workflow summary/artifact instead of an agent PR).
 - **Scopes used** — list every Conventional Commit scope you used (`invoices-v1`, `shared`, etc.) so reviewers and automation can audit split mode.
 - **Renamed properties** table: `oldName | newName | files touched`.
 - **New properties surfaced** table: `property | UI surface(s) | rationale`.
