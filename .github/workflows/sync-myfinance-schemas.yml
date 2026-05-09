@@ -27,6 +27,12 @@
 
 name: Sync myfinance schemas (Cursor agent)
 
+# One in-flight run per workflow; additional triggers queue until the active run
+# finishes (unless a run is manually cancelled). Does not cancel an older run.
+concurrency:
+  group: sync-myfinance-schemas
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
     inputs:
@@ -48,7 +54,7 @@ on:
         type: boolean
         default: false
       dry_run:
-        description: "Skip codegen and PR creation. The agent only commits SYNC_REPORT.md describing what it would change."
+        description: "CI-only dry-run: skips agent and any ui-myfinance push/PR; drift + planned codegen are in the dry-run-summary job (log + artifact)."
         type: boolean
         default: false
       model:
@@ -64,19 +70,6 @@ on:
           - composer-2
           - gpt-5-codex-high
           - o3
-      base_branch_override:
-        description: "Override the ui-myfinance branch the sync forks from. Leave empty to use that repo's default branch."
-        required: false
-        default: ""
-      wait_for_agent_run:
-        description: "Block this workflow until the cloud agent finishes, so failures show up in this run instead of silently."
-        type: boolean
-        default: true
-      agent_poll_timeout_minutes:
-        description: "Maximum wait when 'wait_for_agent_run' is on. Typical successful runs finish in 10-25 minutes."
-        required: false
-        default: "60"
-
 jobs:
   # ──────────────────────────────────────────────────────────────────────
   # Job 1: Deterministic pre-flight gate.
@@ -122,7 +115,6 @@ jobs:
         env:
           SCHEMA_INPUT: ${{ inputs.schema }}
           DRY_RUN: ${{ inputs.dry_run }}
-          INPUT_UI_BRANCH: ${{ inputs.base_branch_override }}
           GH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
         run: |
           set -euo pipefail
@@ -243,15 +235,11 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           # Base ref for ui-myfinance (fork point + dry-run agent checkout)
-          if [ -n "${INPUT_UI_BRANCH}" ]; then
-            BASE_REF="$INPUT_UI_BRANCH"
-          else
-            BASE_REF=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/Maersk-Global/ui-myfinance" \
-              | jq -er .default_branch)
-          fi
+          BASE_REF=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/Maersk-Global/ui-myfinance" \
+            | jq -er .default_branch)
           echo "base_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
 
           SHORT_SHA="${SOURCE_SHA:0:7}"
@@ -262,7 +250,7 @@ jobs:
             echo "agent_starting_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
             {
               echo ""
-              echo "**Dry run:** no schema branch pushed. Cloud Agent \`startingRef\`: \`$BASE_REF\` (schemas on disk are not pre-synced)."
+              echo "**Dry run:** no schema branch pushed; **Launch Cursor agent** job is skipped. See job **Dry-run report (no agent)** for the markdown artifact and extended summary (no commits to ui-myfinance)."
             } >> "$GITHUB_STEP_SUMMARY"
           else
             rm -rf /tmp/ui-stage
@@ -305,16 +293,102 @@ jobs:
           fi
 
   # ──────────────────────────────────────────────────────────────────────
+  # Job 2a: Dry-run only — CI report from detect-drift outputs (no agent, no ui-myfinance changes).
+  # ──────────────────────────────────────────────────────────────────────
+  dry-run-summary:
+    name: Dry-run report (no agent)
+    runs-on: ubuntu-latest
+    needs: detect-drift
+    if: needs.detect-drift.outputs.has_changes == 'true' && inputs.dry_run == 'true'
+    steps:
+      - name: Write dry-run summary and artifact
+        env:
+          CHANGED_FILES: ${{ needs.detect-drift.outputs.changed_files }}
+          SOURCE_SHA: ${{ needs.detect-drift.outputs.source_sha }}
+          BASE_REF: ${{ needs.detect-drift.outputs.base_ref }}
+          SCHEMA_INPUT: ${{ inputs.schema }}
+        run: |
+          set -euo pipefail
+
+          codegen_for_local() {
+            case "$1" in
+              myfinance-invoices-API.v1.yml) echo "\`npm run codegen-invoices\`" ;;
+              myfinance-invoices-API.v2.yaml) echo "\`npm run codegen-invoices-v2\`" ;;
+              myfinance-submit-proof-of-payment-API.v1.yaml) echo "\`npm run codegen-proof-of-payment\`" ;;
+              myfinance-export-documents-API.v1.yml) echo "\`npm run codegen-export-documents\`" ;;
+              myfinance-refund-request-API.v1.yaml) echo "\`npm run codegen-refund-request\`" ;;
+              myfinance-estatements-API.v1.yml) echo "\`npm run codegen-estatements\`" ;;
+              myfinance-workflows-API.v1.yaml) echo "\`npm run codegen-workflows\`" ;;
+              *) echo "_unmapped — add to codegen table in prompt if needed_" ;;
+            esac
+          }
+
+          REPORT_FILE="$RUNNER_TEMP/sync-myfinance-dry-run.md"
+          {
+            echo "## Dry-run: sync myfinance schemas"
+            echo ""
+            echo "No Cloud Agent run and **no commits or pushes** to \`Maersk-Global/ui-myfinance\`. This file mirrors the workflow step summary."
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| API source SHA | \`$SOURCE_SHA\` |"
+            echo "| ui-myfinance base ref | \`$BASE_REF\` |"
+            echo "| Schema filter | \`$SCHEMA_INPUT\` |"
+            echo ""
+            echo "### Drift (from CI \`CHANGED_FILES\`)"
+            echo ""
+          } > "$REPORT_FILE"
+
+          for status in added modified deleted; do
+            echo "#### ${status^}" >> "$REPORT_FILE"
+            rows=$(echo "$CHANGED_FILES" | jq -c --arg s "$status" '[.[] | select(.status == $s)]')
+            n=$(echo "$rows" | jq 'length')
+            if [ "$n" -eq 0 ]; then
+              echo "_None._" >> "$REPORT_FILE"
+            else
+              echo "" >> "$REPORT_FILE"
+              echo "| Local file | Remote (API repo) | Planned codegen (normal run) |" >> "$REPORT_FILE"
+              echo "|------------|-------------------|------------------------------|" >> "$REPORT_FILE"
+              while IFS= read -r row; do
+                local_name=$(echo "$row" | jq -r .local)
+                remote=$(echo "$row" | jq -r .remote)
+                if [ "$status" = "deleted" ]; then
+                  plan="_remove UI usage; no codegen_"
+                else
+                  plan=$(codegen_for_local "$local_name")
+                fi
+                echo "| \`$local_name\` | \`$remote\` | $plan |" >> "$REPORT_FILE"
+              done < <(echo "$rows" | jq -c '.[]')
+            fi
+            echo "" >> "$REPORT_FILE"
+          done
+
+          {
+            echo "### What a normal run would do next"
+            echo ""
+            echo "After codegen, the Cloud Agent adapts UI, tests, and fixtures per \`.cursor/prompts/sync-myfinance-schemas.md\` (not executed in dry-run)."
+            echo ""
+          } >> "$REPORT_FILE"
+
+          cat "$REPORT_FILE" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sync-myfinance-dry-run-report
+          path: ${{ runner.temp }}/sync-myfinance-dry-run.md
+
+  # ──────────────────────────────────────────────────────────────────────
   # Job 2: Launch the Cursor Cloud Agent.
   # Only runs when detect-drift found at least one changed file.
   # Embeds the pre-computed change list and source SHA into the prompt
   # so the agent skips re-enumeration entirely.
+  # Skipped when dry_run: drift report is CI-only (dry-run-summary job).
   # ──────────────────────────────────────────────────────────────────────
   launch-agent:
     name: Launch Cursor agent
     runs-on: ubuntu-latest
     needs: detect-drift
-    if: needs.detect-drift.outputs.has_changes == 'true'
+    if: needs.detect-drift.outputs.has_changes == 'true' && inputs.dry_run != 'true'
     outputs:
       agent_branch: ${{ steps.launch.outputs.agent_branch }}
     steps:
@@ -341,8 +415,6 @@ jobs:
         id: launch
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
-          WAIT_FOR_RUN: ${{ inputs.wait_for_agent_run }}
-          POLL_TIMEOUT_MIN: ${{ inputs.agent_poll_timeout_minutes }}
           AGENT_STARTING_REF: ${{ needs.detect-drift.outputs.agent_starting_ref }}
           SPLIT_PR: ${{ inputs.split_into_pr_per_schema }}
           SCHEMA_IN: ${{ inputs.schema }}
@@ -359,6 +431,10 @@ jobs:
           if [ "${SPLIT_PR}" = "true" ] && [ "${SCHEMA_IN}" = "(all)" ] && [ "${DRY_RUN_IN}" != "true" ] && [ -n "${STAGED_IN}" ]; then
             AUTO_CREATE_PR=false
             echo "split_into_pr_per_schema: disabling Cursor autoCreatePR (split-into-prs will open PRs)."
+          fi
+          # This job is skipped when dry_run is true; if that guard is removed, never auto-open a PR from dry-run.
+          if [ "${DRY_RUN_IN}" = "true" ]; then
+            AUTO_CREATE_PR=false
           fi
 
           ACP_JSON=true
@@ -414,44 +490,30 @@ jobs:
 
           FILE_COUNT=$(echo '${{ needs.detect-drift.outputs.changed_files }}' | jq 'length')
 
-          POLL_TIMEOUT_MIN="${POLL_TIMEOUT_MIN:-60}"
-
-          if [ "${WAIT_FOR_RUN}" = "true" ]; then
-            DEADLINE=$(($(date +%s) + POLL_TIMEOUT_MIN * 60))
-            while true; do
-              NOW=$(date +%s)
-              if [ "$NOW" -ge "$DEADLINE" ]; then
-                echo "::error::Timed out after ${POLL_TIMEOUT_MIN} minutes waiting for Cursor run $RUN_ID"
+          # Poll until a terminal status; overall wall clock is still bounded by the runner job timeout.
+          while true; do
+            RUN_JSON=$(curl -sS -u "${CURSOR_API_KEY}:" \
+              "https://api.cursor.com/v1/agents/${AGENT_ID}/runs/${RUN_ID}")
+            STATUS=$(echo "$RUN_JSON" | jq -r .status)
+            echo "Cursor run status: $STATUS"
+            case "$STATUS" in
+              FINISHED)
+                if [ "$AUTO_CREATE_PR" = "true" ]; then
+                  echo "Run FINISHED — if GitHub allows it, Cursor opens the PR after this point."
+                else
+                  echo "Run FINISHED — split-into-prs job will open umbrella + per-scope PRs."
+                fi
+                break
+                ;;
+              ERROR|CANCELLED|EXPIRED)
+                echo "::error::Cursor run ended with status=$STATUS (no PR). Open the agent for logs: $AGENT_URL"
                 exit 1
-              fi
-              RUN_JSON=$(curl -sS -u "${CURSOR_API_KEY}:" \
-                "https://api.cursor.com/v1/agents/${AGENT_ID}/runs/${RUN_ID}")
-              STATUS=$(echo "$RUN_JSON" | jq -r .status)
-              echo "Cursor run status: $STATUS"
-              case "$STATUS" in
-                FINISHED)
-                  if [ "$AUTO_CREATE_PR" = "true" ]; then
-                    echo "Run FINISHED — if GitHub allows it, Cursor opens the PR after this point."
-                  else
-                    echo "Run FINISHED — split-into-prs job will open umbrella + per-scope PRs."
-                  fi
-                  break
-                  ;;
-                ERROR|CANCELLED|EXPIRED)
-                  echo "::error::Cursor run ended with status=$STATUS (no PR). Open the agent for logs: $AGENT_URL"
-                  exit 1
-                  ;;
-                *)
-                  sleep 30
-                  ;;
-              esac
-            done
-          else
-            echo "Not polling run status — open $AGENT_URL and wait for FINISHED to see the PR on GitHub."
-            if [ "${SPLIT_PR}" = "true" ] && [ "${SCHEMA_IN}" = "(all)" ] && [ "${DRY_RUN_IN}" != "true" ] && [ -n "${STAGED_IN}" ]; then
-              echo "::warning::split_into_pr_per_schema is ignored when wait_for_agent_run is false — run must finish before deterministic PR split."
-            fi
-          fi
+                ;;
+              *)
+                sleep 30
+                ;;
+            esac
+          done
 
           {
             echo "### Cursor agent"
@@ -480,7 +542,6 @@ jobs:
       needs.detect-drift.outputs.has_changes == 'true' &&
       needs.launch-agent.result == 'success' &&
       inputs.split_into_pr_per_schema == true &&
-      inputs.wait_for_agent_run == true &&
       inputs.schema == '(all)' &&
       inputs.dry_run == false &&
       needs.detect-drift.outputs.staged_branch != ''
