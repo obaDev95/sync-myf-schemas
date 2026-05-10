@@ -687,10 +687,28 @@ jobs:
           mapfile -t SCOPES < <(echo "$GROUPS" | jq -r 'keys[]')
 
           FAILURES=0
+          # Track child branch names within this run so two long scopes that
+          # share a 60-char prefix can't silently produce the same branch and
+          # have one PR overwrite another.
+          declare -A SEEN_CHILD=()
           for sc in "${SCOPES[@]}"; do
             [ -z "$sc" ] && continue
-            branch_safe=$(echo "$sc" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g' | cut -c1-60)
+            slug_clean=$(echo "$sc" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g')
+            if [ "${#slug_clean}" -gt 60 ]; then
+              # Disambiguate by appending a short hash of the full slug, so
+              # `something-very-long-A` and `something-very-long-B` get distinct
+              # branches even if their first 60 chars match.
+              suffix=$(printf '%s' "$slug_clean" | shasum | cut -c1-6)
+              branch_safe="${slug_clean:0:53}-${suffix}"
+            else
+              branch_safe="$slug_clean"
+            fi
             CHILD="sync/myfinance-ui-${SHORT_SHA}-${branch_safe}"
+            if [ -n "${SEEN_CHILD[$CHILD]:-}" ]; then
+              echo "::error::Branch name collision after truncation: scope '$sc' would produce branch '$CHILD' already used by scope '${SEEN_CHILD[$CHILD]}'. Shorten one of the slugs in scripts/myfinance-schema-map.tsv."
+              exit 1
+            fi
+            SEEN_CHILD["$CHILD"]="$sc"
 
             mapfile -t SHA_LIST < <(echo "$GROUPS" | jq -r --arg s "$sc" '.[$s][]')
 
