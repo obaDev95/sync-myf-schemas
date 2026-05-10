@@ -492,7 +492,8 @@ jobs:
           AGENT_URL=$(jq -r '.agent.url // "unknown"' /tmp/create-agent.json)
           BRANCH=$(jq -r '.agent.branchName // empty' /tmp/create-agent.json)
           if [ -z "$BRANCH" ] || [ "$BRANCH" = "null" ]; then
-            BRANCH="auto-generated"
+            echo "::error::Cursor /v1/agents response did not include agent.branchName; cannot run split-into-prs without it. Open the agent URL: $AGENT_URL"
+            exit 1
           fi
           echo "agent_branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
@@ -581,10 +582,6 @@ jobs:
           REPO="Maersk-Global/ui-myfinance"
           SHORT_SHA="${SOURCE_SHA:0:7}"
 
-          if [ -z "${AGENT_BRANCH}" ] || [ "$AGENT_BRANCH" = "auto-generated" ]; then
-            echo "::error::Agent branch name missing or unknown; cannot split PRs."
-            exit 1
-          fi
 
           rm -rf /tmp/ui-split
           git clone --no-single-branch \
