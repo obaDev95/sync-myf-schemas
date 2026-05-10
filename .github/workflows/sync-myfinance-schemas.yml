@@ -422,6 +422,7 @@ jobs:
           DRY_RUN_IN: ${{ inputs.dry_run }}
           STAGED_IN: ${{ needs.detect-drift.outputs.staged_branch }}
           MODEL_INPUT: ${{ inputs.model }}
+          CHANGED_FILES_JSON: ${{ needs.detect-drift.outputs.changed_files }}
         run: |
           set -euo pipefail
 
@@ -489,7 +490,7 @@ jobs:
           fi
           echo "agent_branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
-          FILE_COUNT=$(echo '${{ needs.detect-drift.outputs.changed_files }}' | jq 'length')
+          FILE_COUNT=$(printf '%s' "$CHANGED_FILES_JSON" | jq 'length')
 
           # Poll until a terminal status; overall wall clock is still bounded by the runner job timeout.
           while true; do
