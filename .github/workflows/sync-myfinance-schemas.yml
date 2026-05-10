@@ -493,7 +493,10 @@ jobs:
 
           FILE_COUNT=$(printf '%s' "$CHANGED_FILES_JSON" | jq 'length')
 
-          # Poll until a terminal status; overall wall clock is still bounded by the runner job timeout.
+          # Poll until a terminal status; overall wall clock is bounded by the runner job timeout.
+          # Cadence scales with elapsed time so a quick FINISHED/ERROR is observed within seconds
+          # while long-running cases don't burn API calls every 30s for an hour.
+          START=$(date +%s)
           while true; do
             RUN_JSON=$(curl -sS -u "${CURSOR_API_KEY}:" \
               "https://api.cursor.com/v1/agents/${AGENT_ID}/runs/${RUN_ID}")
@@ -513,7 +516,12 @@ jobs:
                 exit 1
                 ;;
               *)
-                sleep 30
+                ELAPSED=$(( $(date +%s) - START ))
+                if [ "$ELAPSED" -lt 300 ]; then
+                  sleep 20
+                else
+                  sleep 60
+                fi
                 ;;
             esac
           done
