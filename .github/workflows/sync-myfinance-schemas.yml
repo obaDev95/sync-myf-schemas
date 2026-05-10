@@ -412,7 +412,12 @@ jobs:
           SOURCE_SHA: ${{ needs.detect-drift.outputs.source_sha }}
         run: |
           set -euo pipefail
-          PROMPT=$(envsubst < .cursor/prompts/sync-myfinance-schemas.md)
+          # Allowlist the variables we actually template into the prompt; without
+          # this, any `$IDENT` later added to the markdown (e.g. inside a code
+          # block illustrating a shell command) would be silently consumed.
+          PROMPT=$(envsubst \
+            '$SCHEMA $SPLIT_INTO_PR_PER_SCHEMA $SELECTED_SCHEMAS $DRY_RUN $ACTOR $CHANGED_FILES $SOURCE_SHA' \
+            < .cursor/prompts/sync-myfinance-schemas.md)
           # Write to a file — do not pass the prompt via GITHUB_OUTPUT or inline
           # workflow expressions into the next step's shell; JSON/markdown/newlines/braces
           # break the runner script if inlined.
