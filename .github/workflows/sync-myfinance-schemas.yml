@@ -474,14 +474,33 @@ jobs:
           jq -e . /tmp/create-agent-body.json >/dev/null
           echo "Create-agent POST body top-level keys: $(jq -c 'keys | sort' /tmp/create-agent-body.json)"
 
-          HTTP_CODE=$(curl -sS -o /tmp/create-agent.json -w "%{http_code}" -X POST https://api.cursor.com/v1/agents \
-            -u "${CURSOR_API_KEY}:" \
-            -H 'Content-Type: application/json' \
-            --data-binary @/tmp/create-agent-body.json)
+          # Retry only on transient failures (network errors, 5xx, 429). 4xx
+          # responses indicate a bad payload and will not become valid by
+          # waiting; surface those immediately.
+          HTTP_CODE=""
+          for attempt in 1 2 3; do
+            HTTP_CODE=$(curl -sS -o /tmp/create-agent.json -w "%{http_code}" -X POST https://api.cursor.com/v1/agents \
+              -u "${CURSOR_API_KEY}:" \
+              -H 'Content-Type: application/json' \
+              --data-binary @/tmp/create-agent-body.json || echo "000")
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
+              break
+            fi
+            case "$HTTP_CODE" in
+              000|429|5??)
+                BACKOFF=$((attempt * 5))
+                echo "Cursor POST /v1/agents returned HTTP $HTTP_CODE on attempt $attempt; retrying in ${BACKOFF}s"
+                sleep "$BACKOFF"
+                ;;
+              *)
+                break
+                ;;
+            esac
+          done
 
           jq . /tmp/create-agent.json
           if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
-            echo "::error::Cursor POST /v1/agents failed with HTTP $HTTP_CODE"
+            echo "::error::Cursor POST /v1/agents failed with HTTP $HTTP_CODE after retries"
             echo "Request top-level keys (for support / debugging): $(jq -c 'keys | sort' /tmp/create-agent-body.json)"
             exit 1
           fi
