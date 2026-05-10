@@ -448,9 +448,8 @@ jobs:
           ACP_JSON=true
           [ "$AUTO_CREATE_PR" = "false" ] && ACP_JSON=false
 
-          # Build JSON on disk (do not pipe BODY through echo | jq — huge / odd prompts are safer
-          # this way). The live /v1/agents validator rejects top-level branchName; keep the payload
-          # to prompt + repos + autoCreatePR only (omit skipReviewerRequest for older gateways).
+          # Build the POST body on disk; piping a large rawfile prompt through
+          # echo | jq breaks for prompts containing certain control sequences.
           jq -n \
             --rawfile text /tmp/agent-prompt.txt \
             --arg repo "https://github.com/Maersk-Global/ui-myfinance" \
@@ -468,11 +467,6 @@ jobs:
           fi
 
           jq -e . /tmp/create-agent-body.json >/dev/null
-          if jq -e 'has("branchName")' /tmp/create-agent-body.json >/dev/null 2>&1; then
-            echo "::error::Refusing to POST: body unexpectedly contains top-level branchName (would trigger Cursor validation_error)."
-            jq 'keys' /tmp/create-agent-body.json
-            exit 1
-          fi
           echo "Create-agent POST body top-level keys: $(jq -c 'keys | sort' /tmp/create-agent-body.json)"
 
           HTTP_CODE=$(curl -sS -o /tmp/create-agent.json -w "%{http_code}" -X POST https://api.cursor.com/v1/agents \
