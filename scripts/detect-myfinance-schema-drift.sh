@@ -144,21 +144,24 @@ SRC="$API_DIR"
 SOURCE_SHA=$(git -C "$SRC" rev-parse HEAD)
 CHANGES='[]'
 
-MAPPING=$(cat <<'MAP'
-apis/500-Maersk.com/v1/myfinance-invoices-API.v1.yml	myfinance-invoices-API.v1.yml
-apis/500-Maersk.com/v2/myfinance-invoices-API.v2.yaml	myfinance-invoices-API.v2.yaml
-apis/500-Maersk.com/v1/myfinance-submit-proof-of-payment-API.v1.yaml	myfinance-submit-proof-of-payment-API.v1.yaml
-apis/500-Maersk.com/v1/35-myfinance-export-documents-API.v1.yml	myfinance-export-documents-API.v1.yml
-apis/500-Maersk.com/v1/myfinance-refund-request-API.v1.yaml	myfinance-refund-request-API.v1.yaml
-apis/500-Maersk.com/v1/myfinance-estatements-API.v1.yml	myfinance-estatements-API.v1.yml
-apis/500-Maersk.com/v1/myfinance-workflows-API.v1.yaml	myfinance-workflows-API.v1.yaml
-MAP
-)
+MAP_FILE="$REPO_ROOT/scripts/myfinance-schema-map.tsv"
+if [ ! -f "$MAP_FILE" ]; then
+  echo "Schema map file missing: $MAP_FILE" >&2
+  exit 1
+fi
+
+# Build a 2-column subset (remote_path, local_name) from the source-of-truth TSV;
+# this loop only needs those two fields, slug + codegen are consumed by CI.
+MAPPING=""
+while IFS=$'\t' read -r remote_rel local_name _slug _codegen; do
+  [ -z "${remote_rel:-}" ] && continue
+  case "$remote_rel" in \#*) continue ;; esac
+  MAPPING+="${remote_rel}"$'\t'"${local_name}"$'\n'
+done < "$MAP_FILE"
 
 cd "$REPO_ROOT"
 while IFS=$'\t' read -r remote_rel local_name; do
-  remote_rel=$(echo "$remote_rel" | xargs)
-  local_name=$(echo "$local_name" | xargs)
+  [ -z "${remote_rel:-}" ] && continue
   if [ -n "$SCHEMA_FILE" ]; then
     if [ "$local_name" != "$SCHEMA_FILE" ]; then
       continue

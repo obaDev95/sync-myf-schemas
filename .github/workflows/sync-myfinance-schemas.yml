@@ -122,41 +122,27 @@ jobs:
           UI_SRC=/tmp/ui-src
           SOURCE_SHA=$(git -C "$SRC" rev-parse HEAD)
 
-          slug_for_local() {
-            case "$1" in
-              myfinance-invoices-API.v1.yml) echo invoices-v1 ;;
-              myfinance-invoices-API.v2.yaml) echo invoices-v2 ;;
-              myfinance-submit-proof-of-payment-API.v1.yaml) echo submit-proof-of-payment ;;
-              myfinance-export-documents-API.v1.yml) echo export-documents ;;
-              myfinance-refund-request-API.v1.yaml) echo refund-request ;;
-              myfinance-estatements-API.v1.yml) echo estatements ;;
-              myfinance-workflows-API.v1.yaml) echo workflows ;;
-              *) echo shared ;;
-            esac
-          }
+          # Mapping comes from the single source-of-truth TSV checked into this repo.
+          # See scripts/myfinance-schema-map.tsv for column docs and add-a-schema instructions.
+          MAP_FILE="$GITHUB_WORKSPACE/scripts/myfinance-schema-map.tsv"
+          if [ ! -f "$MAP_FILE" ]; then
+            echo "::error::Schema map file missing: $MAP_FILE"
+            exit 1
+          fi
 
-          # ── Mapping table ──────────────────────────────────────────
-          # Each line: <remote path relative to repo root> <TAB> <local filename in schemas/>
-          # The public repo uses different directory prefixes and occasionally
-          # a "35-" filename prefix that the local copy strips.
-          # Only files we actually run codegen for are tracked.
-          MAPPING=$(cat <<'MAP'
-          apis/500-Maersk.com/v1/myfinance-invoices-API.v1.yml	myfinance-invoices-API.v1.yml
-          apis/500-Maersk.com/v2/myfinance-invoices-API.v2.yaml	myfinance-invoices-API.v2.yaml
-          apis/500-Maersk.com/v1/myfinance-submit-proof-of-payment-API.v1.yaml	myfinance-submit-proof-of-payment-API.v1.yaml
-          apis/500-Maersk.com/v1/35-myfinance-export-documents-API.v1.yml	myfinance-export-documents-API.v1.yml
-          apis/500-Maersk.com/v1/myfinance-refund-request-API.v1.yaml	myfinance-refund-request-API.v1.yaml
-          apis/500-Maersk.com/v1/myfinance-estatements-API.v1.yml	myfinance-estatements-API.v1.yml
-          apis/500-Maersk.com/v1/myfinance-workflows-API.v1.yaml	myfinance-workflows-API.v1.yaml
-          MAP
-          )
+          declare -A SLUG_BY_LOCAL
+          MAPPING=""
+          while IFS=$'\t' read -r remote_rel local_name slug _codegen; do
+            [ -z "${remote_rel:-}" ] && continue
+            case "$remote_rel" in \#*) continue ;; esac
+            MAPPING+="${remote_rel}"$'\t'"${local_name}"$'\n'
+            SLUG_BY_LOCAL["$local_name"]="$slug"
+          done < "$MAP_FILE"
 
           CHANGES='[]'
 
           while IFS=$'\t' read -r remote_rel local_name; do
-            # Trim leading whitespace from heredoc indentation
-            remote_rel=$(echo "$remote_rel" | xargs)
-            local_name=$(echo "$local_name" | xargs)
+            [ -z "${remote_rel:-}" ] && continue
 
             # Honour schema filter (exact local filename) when not "(all)"
             if [ "$SCHEMA_INPUT" != "(all)" ] && [ "$local_name" != "$SCHEMA_INPUT" ]; then
@@ -201,7 +187,11 @@ jobs:
           SELECTED_SCHEMAS='[]'
           while IFS= read -r row; do
             local_name=$(echo "$row" | jq -r .local)
-            slug=$(slug_for_local "$local_name")
+            slug="${SLUG_BY_LOCAL[$local_name]:-}"
+            if [ -z "$slug" ]; then
+              echo "::error::No slug mapped for $local_name in scripts/myfinance-schema-map.tsv"
+              exit 1
+            fi
             SELECTED_SCHEMAS=$(echo "$SELECTED_SCHEMAS" | jq --arg s "$slug" '. + [$s]')
           done < <(echo "$CHANGES" | jq -c '.[]')
           SELECTED_SCHEMAS=$(echo "$SELECTED_SCHEMAS" | jq 'unique')
@@ -310,17 +300,28 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Codegen mapping comes from the same source-of-truth TSV detect-drift uses,
+          # so the dry-run summary cannot drift away from the live mapping.
+          MAP_FILE="$GITHUB_WORKSPACE/scripts/myfinance-schema-map.tsv"
+          if [ ! -f "$MAP_FILE" ]; then
+            echo "::error::Schema map file missing: $MAP_FILE"
+            exit 1
+          fi
+
+          declare -A CODEGEN_BY_LOCAL
+          while IFS=$'\t' read -r _remote local_name _slug codegen; do
+            [ -z "${local_name:-}" ] && continue
+            case "${_remote}" in \#*) continue ;; esac
+            CODEGEN_BY_LOCAL["$local_name"]="$codegen"
+          done < "$MAP_FILE"
+
           codegen_for_local() {
-            case "$1" in
-              myfinance-invoices-API.v1.yml) echo "\`npm run codegen-invoices\`" ;;
-              myfinance-invoices-API.v2.yaml) echo "\`npm run codegen-invoices-v2\`" ;;
-              myfinance-submit-proof-of-payment-API.v1.yaml) echo "\`npm run codegen-proof-of-payment\`" ;;
-              myfinance-export-documents-API.v1.yml) echo "\`npm run codegen-export-documents\`" ;;
-              myfinance-refund-request-API.v1.yaml) echo "\`npm run codegen-refund-request\`" ;;
-              myfinance-estatements-API.v1.yml) echo "\`npm run codegen-estatements\`" ;;
-              myfinance-workflows-API.v1.yaml) echo "\`npm run codegen-workflows\`" ;;
-              *) echo "_unmapped — add to codegen table in prompt if needed_" ;;
-            esac
+            local cg="${CODEGEN_BY_LOCAL[$1]:-}"
+            if [ -z "$cg" ]; then
+              echo "_unmapped — add to scripts/myfinance-schema-map.tsv_"
+            else
+              echo "\`npm run ${cg}\`"
+            fi
           }
 
           REPORT_FILE="$RUNNER_TEMP/sync-myfinance-dry-run.md"

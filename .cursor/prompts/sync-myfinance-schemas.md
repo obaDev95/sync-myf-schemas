@@ -46,6 +46,8 @@ Do **not** run codegen, change UI code, push, or open a PR unless an operator ex
 
 ## Schema slug reference (for `SPLIT_INTO_PR_PER_SCHEMA=true`)
 
+> Source of truth: [`scripts/myfinance-schema-map.tsv`](../../scripts/myfinance-schema-map.tsv) in the automation repo. The two tables below are mirrors; if they ever disagree with the TSV, trust the TSV.
+
 Use these **exact** scopes in commit messages when split mode is on. They must match
 `SELECTED_SCHEMAS` for the files you touch in each commit.
 
