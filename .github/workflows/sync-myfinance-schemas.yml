@@ -33,6 +33,12 @@ concurrency:
   group: sync-myfinance-schemas
   cancel-in-progress: false
 
+# All cross-repo writes (push to ui-myfinance, gh pr create) flow through
+# MAERSK_SCHEMAS_PAT, not GITHUB_TOKEN. Drop GITHUB_TOKEN to read-only on this
+# repo so a compromised step cannot write back here or open PRs in this repo.
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
     inputs:
