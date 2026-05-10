@@ -634,7 +634,11 @@ jobs:
           echo "Agent:  ${AGENT_BRANCH} @ ${AGENT_SHA}"
 
           # ── Umbrella PR: BASE_REF <- STAGED_BRANCH (schema sync only until children merge)
-          EXISTING=$(gh pr list -R "$REPO" --base "$BASE_REF" --head "$STAGED_BRANCH" --state open --json number -q '.[0].number // empty' || true)
+          # Check across all states (open, closed, merged). If a previous run created an
+          # umbrella for the same staged branch and it was closed without merging — e.g.
+          # operator cancelled mid-flight — gh pr create would otherwise fail the whole
+          # split job. Reuse the existing PR record and warn instead of creating a duplicate.
+          EXISTING=$(gh pr list -R "$REPO" --base "$BASE_REF" --head "$STAGED_BRANCH" --state all --json number,state -q '.[0]' || echo "")
           if [ -z "${EXISTING}" ]; then
             printf '%s\n' \
               "Automated schema sync from API-JSON-Schema-Definitions @ \`${SOURCE_SHA}\`." \
@@ -649,7 +653,12 @@ jobs:
               --title "chore(schemas): sync myfinance YAMLs from API @ ${SOURCE_SHA}" \
               --body-file /tmp/umbrella-body.md
           else
-            echo "Umbrella PR already exists: #${EXISTING}"
+            EX_NUM=$(echo "$EXISTING" | jq -r '.number')
+            EX_STATE=$(echo "$EXISTING" | jq -r '.state')
+            echo "Umbrella PR for ${STAGED_BRANCH} already exists: #${EX_NUM} (state=${EX_STATE})"
+            if [ "$EX_STATE" = "CLOSED" ]; then
+              echo "::warning::Umbrella PR #${EX_NUM} was closed without merging. Reopen it manually if you intend to ship this sync, or delete branch ${STAGED_BRANCH} to start fresh."
+            fi
           fi
 
           # ── Collect agent commits (exclude merges)
