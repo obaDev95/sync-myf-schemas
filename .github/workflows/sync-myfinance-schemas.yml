@@ -39,6 +39,13 @@ concurrency:
 permissions:
   contents: read
 
+# Centralised so a future fork or rename of either upstream repo touches one
+# location instead of ten. The values are still hardcoded — these names rarely
+# change — but every step now reads $API_REPO / $UI_REPO instead of inlining.
+env:
+  API_REPO: Maersk-Global/API-JSON-Schema-Definitions
+  UI_REPO: Maersk-Global/ui-myfinance
+
 on:
   workflow_dispatch:
     inputs:
@@ -104,7 +111,7 @@ jobs:
           GH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
         run: |
           git clone --depth=1 \
-            "https://x-access-token:${GH_TOKEN}@github.com/Maersk-Global/API-JSON-Schema-Definitions" \
+            "https://x-access-token:${GH_TOKEN}@github.com/${API_REPO}" \
             /tmp/api-src
 
       - name: Sparse-checkout ui-myfinance/schemas
@@ -112,7 +119,7 @@ jobs:
           GH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
         run: |
           git clone --depth=1 --filter=blob:none --sparse \
-            "https://x-access-token:${GH_TOKEN}@github.com/Maersk-Global/ui-myfinance" \
+            "https://x-access-token:${GH_TOKEN}@github.com/${UI_REPO}" \
             /tmp/ui-src
           git -C /tmp/ui-src sparse-checkout set schemas
 
@@ -234,7 +241,7 @@ jobs:
           BASE_REF=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/Maersk-Global/ui-myfinance" \
+            "https://api.github.com/repos/${UI_REPO}" \
             | jq -er .default_branch)
           echo "base_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
 
@@ -251,7 +258,7 @@ jobs:
           else
             rm -rf /tmp/ui-stage
             git clone --depth=1 -b "$BASE_REF" \
-              "https://x-access-token:${GH_TOKEN}@github.com/Maersk-Global/ui-myfinance" \
+              "https://x-access-token:${GH_TOKEN}@github.com/${UI_REPO}" \
               /tmp/ui-stage
             git -C /tmp/ui-stage config user.email "github-actions[bot]@users.noreply.github.com"
             git -C /tmp/ui-stage config user.name "github-actions[bot]"
@@ -277,7 +284,7 @@ jobs:
             git -C /tmp/ui-stage add schemas/
             git -C /tmp/ui-stage commit -m "chore(schemas): sync myfinance YAMLs from API repo @ ${SOURCE_SHA}"
             git -C /tmp/ui-stage remote set-url origin \
-              "https://x-access-token:${GH_TOKEN}@github.com/Maersk-Global/ui-myfinance.git"
+              "https://x-access-token:${GH_TOKEN}@github.com/${UI_REPO}.git"
             git -C /tmp/ui-stage push --force-with-lease origin "$STAGE_BRANCH"
 
             echo "staged_branch=$STAGE_BRANCH" >> "$GITHUB_OUTPUT"
@@ -334,7 +341,7 @@ jobs:
           {
             echo "## Dry-run: sync myfinance schemas"
             echo ""
-            echo "No Cloud Agent run and **no commits or pushes** to \`Maersk-Global/ui-myfinance\`. This file mirrors the workflow step summary."
+            echo "No Cloud Agent run and **no commits or pushes** to \`${UI_REPO}\`. This file mirrors the workflow step summary."
             echo ""
             echo "| | |"
             echo "|---|---|"
@@ -457,7 +464,7 @@ jobs:
           # echo | jq breaks for prompts containing certain control sequences.
           jq -n \
             --rawfile text /tmp/agent-prompt.txt \
-            --arg repo "https://github.com/Maersk-Global/ui-myfinance" \
+            --arg repo "https://github.com/${UI_REPO}" \
             --arg ref "$REF" \
             --argjson acp "$ACP_JSON" \
             '{
@@ -552,7 +559,7 @@ jobs:
 
           {
             echo "### Cursor agent"
-            echo "- Target repo (PR opens here): **Maersk-Global/ui-myfinance**"
+            echo "- Target repo (PR opens here): **${UI_REPO}**"
             echo "- Agent: $AGENT_URL"
             echo "- Run: \`$RUN_ID\`"
             echo "- Branch: \`$BRANCH\` (Cursor \`startingRef\`: \`$REF\`)"
@@ -605,7 +612,7 @@ jobs:
             return 0
           }
 
-          REPO="Maersk-Global/ui-myfinance"
+          REPO="${UI_REPO}"
           SHORT_SHA="${SOURCE_SHA:0:7}"
 
 
