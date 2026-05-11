@@ -16,27 +16,47 @@ for it in this environment.
 ## Hard rules
 
 - **Never invent or simulate schema YAML or API content.** If you cannot complete a required
-  step (missing file, codegen failure, etc.), stop, make a single commit with message
+  step (missing file, unexpected diff shape, etc.), stop, make a single commit with message
   `chore(sync): aborted due to <short reason>`, and state in the PR body that the run **aborted**
   and why. Do not fabricate files to “complete” the workflow.
 - **Do not re-clone** `Maersk-Global/API-JSON-Schema-Definitions` or assume it is public.
+- **Never run `npm` commands of any kind** — no `npm ci`, no `npm install`, no `npm run codegen-*`,
+  no `npm run typecheck`, no `npm run test:unit`. You have **no registry credentials** in this
+  environment by design (registry auth lives only on the GitHub Actions runner). CI has already
+  regenerated the clients before you started and will run typecheck + unit tests on your final
+  branch after you push. Lean on `grep` / cross-file search to catch missed references.
+- **Never create, read, or reference an `.npmrc` or any other credential-bearing file.** If you
+  encounter one in the working tree, do not stage it, do not echo it, do not mention its
+  contents in any commit message or PR body.
 
 ## Branch and schema state (depends on DRY_RUN)
 
 ### When `DRY_RUN` is not `true` (normal run)
 
-CI has already pushed a branch you are checked out on. **Tip of `HEAD` includes exactly one**
-`chore(schemas): sync myfinance YAMLs from API repo @ …` commit that updates `schemas/`.
-The previous schema tree is **`HEAD~1`**.
+CI has already pushed a branch you are checked out on. **Tip of `HEAD` includes two automated
+commits:**
 
-- To inspect what changed for a given file (if it still exists on `HEAD`):
+- `HEAD`   — `chore(codegen): regenerate clients for myfinance schemas @ …` (regenerated client/types output)
+- `HEAD~1` — `chore(schemas): sync myfinance YAMLs from API repo @ …` (updated `schemas/`)
+- `HEAD~2` — the pre-sync baseline (previous schema + previous generated client)
+
+- To inspect what changed for a given schema YAML:
 
 ```bash
-git diff HEAD~1 HEAD -- schemas/<filename>
+git diff HEAD~2 HEAD~1 -- schemas/<filename>
 ```
 
-- For **deleted** schemas, the file is gone on `HEAD`; use `git show HEAD~1:schemas/<filename>`
+- To inspect what regenerated client output looks like vs. the previous state:
+
+```bash
+git diff HEAD~1 HEAD
+```
+
+- For **deleted** schemas, the file is gone on `HEAD`; use `git show HEAD~2:schemas/<filename>`
   if you need the old content.
+
+You **must not** run codegen yourself — the `chore(codegen):` commit already contains the
+regenerated client. Build on top of `HEAD`.
 
 ### When `DRY_RUN` is `true`
 
@@ -63,13 +83,14 @@ Use these **exact** scopes in commit messages when split mode is on. They must m
 
 Cross-cutting changes (shared util, barrel file, or a single edit that clearly serves more than one schema slug above) must use scope **`shared`**: `chore(shared): …` or `feat(shared): …` as appropriate.
 
-## Schema → codegen script mapping
+## Schema → codegen script mapping (reference only — **CI runs these, not you**)
 
-Use this table to determine which `npm run codegen-*` script to run for each
-changed local schema file. In CI, when `DRY_RUN=true`, this agent is not launched and the workflow lists planned scripts in the dry-run summary/artifact instead. If you run with `DRY_RUN=true` manually, skip codegen. If a changed file is not in this table, list it
-under "Unmapped files" in the PR description.
+CI runs the matching `npm run codegen-*` script for every drifted schema on the GitHub-hosted
+runner before you start, using credentials you do not have access to. The regenerated output
+is already on `HEAD` as the `chore(codegen):` commit. The table below is retained only so you
+can confirm which script produced which generated files when inspecting diffs.
 
-| Local schema file                                      | npm script                           |
+| Local schema file                                      | npm script (CI-run)                  |
 |--------------------------------------------------------|--------------------------------------|
 | `schemas/myfinance-invoices-API.v1.yml`                | `codegen-invoices`                   |
 | `schemas/myfinance-invoices-API.v2.yaml`               | `codegen-invoices-v2`                |
@@ -95,21 +116,35 @@ In **GitHub Actions**, `DRY_RUN=true` means there is **no** Cloud Agent step: dr
 
 If you are executing this prompt **manually** with `DRY_RUN=true`, still **do not** invent a repo report file unless operators ask: prefer pasting the same sections into the PR or ticket. Do not run codegen or edit product code until dry-run is lifted.
 
-### 3. Run codegen scripts (skip when this agent was skipped for CI dry-run, or when `DRY_RUN=true` manually)
+### 3. Codegen is done — confirm, don't re-run
 
-For each changed local schema file in CHANGED_FILES, look up the matching `npm run codegen-*`
-command from the mapping table above and run it. If a file has no matching
-script, leave a TODO comment in the PR description under "Unmapped files".
+CI has already executed every applicable `npm run codegen-*` script and committed the result
+as the `chore(codegen):` commit at `HEAD`. **Do not run codegen yourself.** You have no
+registry credentials. Confirm the regenerated client is present by inspecting:
+
+```bash
+git log -1 --oneline HEAD
+git diff --stat HEAD~1 HEAD
+```
+
+If the `chore(codegen):` commit is missing or empty, that is a CI bug — stop and follow the
+abort rule (Hard rules). Do not attempt to compensate.
+
+If a drifted schema was unmapped, CI will have emitted a `::warning::` in the workflow log;
+list any such file under "Unmapped files" in the PR description.
 
 ### 4. Adapt the UI to the schema diff (mandatory when not dry-run)
 
-For each **modified** schema, compare against the parent commit:
+For each **modified** schema, compare against the pre-sync baseline:
 
 ```bash
-git diff HEAD~1 HEAD -- schemas/<filename>
+git diff HEAD~2 HEAD~1 -- schemas/<filename>
 ```
 
-For **added** schemas, treat the whole file as new on `HEAD`. For **removed** schemas, remove
+The regenerated client diff (`HEAD~1..HEAD`) is your reference for what the new types and
+client surface look like — read it to see what API the UI now has to call.
+
+For **added** schemas, treat the whole file as new on `HEAD~1`. For **removed** schemas, remove
 UI and test usage as in 4c.
 
 Then apply the matching code changes:
@@ -124,8 +159,9 @@ Then apply the matching code changes:
   definitions, form field names, zod/yup schemas, validation rules, i18n
   keys if they mirror the property name, mock data, MSW handlers, Vitest
   fixtures, Cypress fixtures.
-- Re-run `npm run typecheck` after each rename batch to catch missed
-  references.
+- You cannot run `npm run typecheck` (no registry credentials). Use repeated
+  cross-file `grep` for the old identifier to catch missed references;
+  CI runs typecheck on your final branch and will surface any remaining hit.
 
 #### 4b. Added properties
 
@@ -166,23 +202,19 @@ should be surfaced), add a `// TODO(cursor-sync):` comment, leave the type
 but skip the UI surfacing, and call it out in the PR description under
 "Decisions deferred to reviewer".
 
-### 5. Verify (skip when `DRY_RUN=true`)
+### 5. Verification runs in CI — not here
 
-Run the project's lint / typecheck / unit tests:
-
-```bash
-npm run typecheck
-npm run test:unit
-```
-
-Fix any breakage caused by your changes. If something is genuinely ambiguous,
-leave a `// TODO(cursor-sync):` comment and call it out in the PR description.
+You **must not** run `npm run typecheck` or `npm run test:unit` (no registry credentials).
+After you push, the workflow's `verify-agent-output` job runs both on the GitHub-hosted runner
+against your final branch and surfaces failures as PR checks. Reviewers see red CI for any
+breakage. If you spot something genuinely ambiguous during your edits, leave a
+`// TODO(cursor-sync):` comment and call it out in the PR description.
 
 ### 6. Commit (when not dry-run)
 
 Use logical chunks with Conventional Commits:
 
-- **Do not** add another `chore(schemas): sync myfinance YAMLs from API repo @ …` commit — CI already pushed that on your branch.
+- **Do not** add another `chore(schemas): …` or `chore(codegen): …` commit — CI already pushed both on your branch.
 
 **When `SPLIT_INTO_PR_PER_SCHEMA` is `true`**
 
@@ -207,7 +239,7 @@ When Cursor opens the PR automatically (`autoCreatePR: true` — the default whe
 
 - Source commit SHA: `${SOURCE_SHA}`.
 - The three file sets (ADDED / MODIFIED / DELETED).
-- The codegen script invocations you ran (CI **dry_run** uses the workflow summary/artifact instead of an agent PR).
+- A note that codegen was run by CI on the runner (see the `chore(codegen):` commit on this branch); the dry-run job lists the planned scripts when no agent ran.
 - **Scopes used** — list every Conventional Commit scope you used (`invoices-v1`, `shared`, etc.) so reviewers and automation can audit split mode.
 - **Renamed properties** table: `oldName | newName | files touched`.
 - **New properties surfaced** table: `property | UI surface(s) | rationale`.

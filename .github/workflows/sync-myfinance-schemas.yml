@@ -1,10 +1,16 @@
 # Required repository secrets:
 #   CURSOR_API_KEY      — Cursor Cloud Agents API key (Integrations in Cursor dashboard).
-#   MAERSK_SCHEMAS_PAT — Fine-grained GitHub PAT with Contents: Read on
-#                        Maersk-Global/API-JSON-Schema-Definitions and Contents: Read + Write on
-#                        Maersk-Global/ui-myfinance (Write is required to push the pre-staged
-#                        sync branch the Cloud Agent checks out, and for split-into-prs to push
-#                        child branches and open PRs via gh — include Pull requests: Write on ui-myfinance).
+#   MAERSK_SCHEMAS_PAT — Fine-grained GitHub PAT with:
+#                          * Contents: Read on Maersk-Global/API-JSON-Schema-Definitions
+#                          * Contents: Read + Write and Pull requests: Write on Maersk-Global/ui-myfinance
+#                            (Write is required to push the pre-staged sync branch the Cloud Agent
+#                            checks out, the runner-side codegen commit, and for split-into-prs to push
+#                            child branches and open PRs via gh.)
+#                          * Packages: Read on Maersk-Global (used by run-codegen and verify-agent-output
+#                            jobs to authenticate `npm ci` for @maersk-global/* packages on GitHub Packages).
+#                        The PAT is consumed exclusively by GitHub-hosted runners; it is never passed to
+#                        the Cursor cloud agent, never written into any committed file, and never sent
+#                        in the agent prompt. The cloud agent runs without registry credentials.
 # Add with: gh secret set CURSOR_API_KEY --repo <owner/repo>
 #           gh secret set MAERSK_SCHEMAS_PAT --repo <owner/repo>
 #
@@ -306,9 +312,153 @@ jobs:
             echo "agent_starting_ref=$STAGE_BRANCH" >> "$GITHUB_OUTPUT"
             {
               echo ""
-              echo "**Pre-staged branch pushed:** \`$STAGE_BRANCH\` (Cloud Agent \`startingRef\`). Tip of branch includes one \`chore(schemas):\` commit; compare with \`HEAD~1\` for YAML diffs."
+              echo "**Pre-staged branch pushed:** \`$STAGE_BRANCH\` (Cloud Agent \`startingRef\`). Tip of branch will include the \`chore(schemas):\` commit plus a \`chore(codegen):\` commit pushed by the next job."
             } >> "$GITHUB_STEP_SUMMARY"
           fi
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Job 1b: Run codegen on the GitHub-hosted runner (NOT in the Cursor sandbox).
+  # The Cursor cloud agent has no GitHub Packages credentials by design — registry
+  # auth lives only on the runner via MAERSK_SCHEMAS_PAT (Packages: Read). This job
+  # clones the staged branch, runs `npm ci`, executes the `npm run codegen-*` scripts
+  # for each drifted schema, and appends a single `chore(codegen):` commit to the
+  # staged branch. The Cursor agent later picks up the branch with both the schema
+  # YAMLs and the regenerated client already in place, and never touches npm.
+  # ──────────────────────────────────────────────────────────────────────
+  run-codegen:
+    name: Run codegen on runner (no agent secrets)
+    runs-on: ubuntu-latest
+    needs: detect-drift
+    if: needs.detect-drift.outputs.has_changes == 'true' && inputs.dry_run != 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone ui-myfinance at staged branch
+        env:
+          GH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
+          STAGED_BRANCH: ${{ needs.detect-drift.outputs.staged_branch }}
+        run: |
+          set -euo pipefail
+          git clone --depth=1 -b "$STAGED_BRANCH" \
+            "https://x-access-token:${GH_TOKEN}@github.com/${UI_REPO}" \
+            ui-myfinance
+          git -C ui-myfinance config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C ui-myfinance config user.name "github-actions[bot]"
+
+      - name: Resolve Node version
+        id: nodever
+        run: |
+          set -euo pipefail
+          # Honour ui-myfinance's pinned Node when present; fall back to LTS so a
+          # missing .nvmrc doesn't silently break codegen on an unpinned major.
+          if [ -f ui-myfinance/.nvmrc ]; then
+            echo "version=$(cat ui-myfinance/.nvmrc)" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=lts/*" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Node with @maersk-global registry auth
+        # setup-node writes its .npmrc to $RUNNER_TEMP and sets NPM_CONFIG_USERCONFIG
+        # to that path. Nothing lands in the checkout, so the credential reference
+        # cannot end up in any committed file.
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.nodever.outputs.version }}
+          registry-url: https://npm.pkg.github.com
+          scope: '@maersk-global'
+          always-auth: true
+
+      - name: Install dependencies
+        working-directory: ui-myfinance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
+        run: npm ci
+
+      - name: Run codegen for drifted schemas
+        working-directory: ui-myfinance
+        env:
+          CHANGED_FILES: ${{ needs.detect-drift.outputs.changed_files }}
+          NODE_AUTH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
+        run: |
+          set -euo pipefail
+          MAP_FILE="$GITHUB_WORKSPACE/scripts/myfinance-schema-map.tsv"
+          if [ ! -f "$MAP_FILE" ]; then
+            echo "::error::Schema map file missing: $MAP_FILE"
+            exit 1
+          fi
+
+          declare -A CODEGEN_BY_LOCAL
+          while IFS=$'\t' read -r _remote local_name _slug codegen; do
+            [ -z "${local_name:-}" ] && continue
+            case "${_remote}" in \#*) continue ;; esac
+            CODEGEN_BY_LOCAL["$local_name"]="$codegen"
+          done < "$MAP_FILE"
+
+          RAN=()
+          while IFS= read -r row; do
+            status=$(echo "$row" | jq -r .status)
+            local_name=$(echo "$row" | jq -r .local)
+            # Deleted schemas have nothing to (re)generate; UI removal is the agent's job.
+            if [ "$status" = "deleted" ]; then
+              continue
+            fi
+            script="${CODEGEN_BY_LOCAL[$local_name]:-}"
+            if [ -z "$script" ]; then
+              echo "::warning::No codegen script mapped for $local_name in scripts/myfinance-schema-map.tsv; skipping"
+              continue
+            fi
+            echo "=== npm run $script (for $local_name) ==="
+            npm run "$script"
+            RAN+=("$script")
+          done < <(echo "$CHANGED_FILES" | jq -c '.[]')
+
+          echo "Codegen scripts executed: ${RAN[*]:-<none>}"
+
+      - name: Guard against credential leakage into working tree
+        working-directory: ui-myfinance
+        run: |
+          set -euo pipefail
+          # Defence in depth: setup-node writes .npmrc outside the checkout, but a
+          # buggy codegen script could conceivably write a token-bearing file into
+          # the working tree. Fail loudly before we even consider staging.
+          LEAKED=$(git status --porcelain | awk '{print $2}' | grep -E '(^|/)\.npmrc$|(^|/)\.env(\..+)?$' || true)
+          if [ -n "$LEAKED" ]; then
+            echo "::error::Credential-shaped file detected in working tree after codegen: $LEAKED"
+            exit 1
+          fi
+
+      - name: Commit and push generated output
+        working-directory: ui-myfinance
+        env:
+          GH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
+          STAGED_BRANCH: ${{ needs.detect-drift.outputs.staged_branch }}
+          SOURCE_SHA: ${{ needs.detect-drift.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          git add -A
+          # Final assertion: even if `git add` somehow staged a credential file
+          # (path masking, alias, etc.), refuse to commit.
+          STAGED_LEAK=$(git diff --cached --name-only | grep -E '(^|/)\.npmrc$|(^|/)\.env(\..+)?$' || true)
+          if [ -n "$STAGED_LEAK" ]; then
+            echo "::error::Refusing to commit credential-shaped file(s): $STAGED_LEAK"
+            exit 1
+          fi
+          if git diff --cached --quiet; then
+            # Codegen producing nothing for a drift event is unusual — either the
+            # scripts are no-ops, or the generated output already matched what
+            # was in the staged checkout (only possible on a re-run). Either way,
+            # surface and continue without an empty commit.
+            echo "::warning::Codegen produced no working-tree changes; skipping commit."
+            exit 0
+          fi
+          git commit -m "chore(codegen): regenerate clients for myfinance schemas @ ${SOURCE_SHA}"
+          # The concurrency group serialises sync runs, so the staged branch tip
+          # should still equal what we cloned. --force-with-lease guards against
+          # an out-of-band push between clone and now (e.g., operator override).
+          EXPECTED_SHA=$(git rev-parse HEAD~1)
+          git push \
+            --force-with-lease="refs/heads/$STAGED_BRANCH:$EXPECTED_SHA" \
+            origin "$STAGED_BRANCH"
 
   # ──────────────────────────────────────────────────────────────────────
   # Job 2a: Dry-run only — CI report from detect-drift outputs (no agent, no ui-myfinance changes).
@@ -416,7 +566,11 @@ jobs:
   launch-agent:
     name: Launch Cursor agent
     runs-on: ubuntu-latest
-    needs: detect-drift
+    # Depend on run-codegen so the agent only launches after generated clients
+    # are committed on the staged branch. If run-codegen fails (codegen error,
+    # registry auth issue), the agent is never invoked — saves Cursor tokens and
+    # keeps the failure signal where the root cause actually is.
+    needs: [detect-drift, run-codegen]
     if: needs.detect-drift.outputs.has_changes == 'true' && inputs.dry_run != 'true'
     outputs:
       agent_branch: ${{ steps.launch.outputs.agent_branch }}
@@ -606,6 +760,65 @@ jobs:
             echo ""
             echo "_When autoCreatePR is true, PRs are created when the run completes successfully (FINISHED). If the run errors, check the agent URL above._"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Job 2b: Verify the agent's output by running typecheck + unit tests on
+  # the runner. The Cursor agent has no registry credentials and cannot run
+  # `npm ci`, so verification cannot live inside the agent — moving it here
+  # is the security counterpart to moving codegen out. Failures hard-fail the
+  # workflow run; branch protection (if configured) blocks merge of the PR.
+  # ──────────────────────────────────────────────────────────────────────
+  verify-agent-output:
+    name: Verify agent output (typecheck + unit tests)
+    runs-on: ubuntu-latest
+    needs: [detect-drift, launch-agent]
+    if: |
+      needs.detect-drift.outputs.has_changes == 'true' &&
+      inputs.dry_run != 'true' &&
+      needs.launch-agent.result == 'success' &&
+      needs.launch-agent.outputs.agent_branch != ''
+    steps:
+      - name: Clone ui-myfinance at agent branch
+        env:
+          GH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
+          AGENT_BRANCH: ${{ needs.launch-agent.outputs.agent_branch }}
+        run: |
+          set -euo pipefail
+          git clone --depth=1 -b "$AGENT_BRANCH" \
+            "https://x-access-token:${GH_TOKEN}@github.com/${UI_REPO}" \
+            ui-myfinance
+
+      - name: Resolve Node version
+        id: nodever
+        run: |
+          set -euo pipefail
+          if [ -f ui-myfinance/.nvmrc ]; then
+            echo "version=$(cat ui-myfinance/.nvmrc)" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=lts/*" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Node with @maersk-global registry auth
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.nodever.outputs.version }}
+          registry-url: https://npm.pkg.github.com
+          scope: '@maersk-global'
+          always-auth: true
+
+      - name: Install dependencies
+        working-directory: ui-myfinance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: ui-myfinance
+        run: npm run typecheck
+
+      - name: Unit tests
+        working-directory: ui-myfinance
+        run: npm run test:unit
 
   # ──────────────────────────────────────────────────────────────────────
   # Job 3: Deterministic PR split (no extra LLM). Cherry-picks agent commits
