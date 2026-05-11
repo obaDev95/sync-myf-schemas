@@ -15,9 +15,8 @@
 #                            (Classic PAT alternative: read:packages for the org.)
 #                          * If the org enforces SAML SSO: authorize the PAT for the org in GitHub
 #                            (Fine-grained PAT → SSO → Configure SSO) or installs keep failing with 403.
-#                        Many Maersk repos’ .npmrc use ${NPM_TOKEN} for GPR; this workflow also exports
-#                        NPM_TOKEN from the same secret so project-level .npmrc does not override auth
-#                        with an empty value (that surfaces as HTTP 403 “expected scopes”).
+#                        ui-myfinance has no checked-in .npmrc; GPR auth is the runner userconfig plus
+#                        NODE_AUTH_TOKEN only — HTTP 403 on npm.pkg.github.com is then PAT/SSO/repo access.
 #                        The PAT is consumed exclusively by GitHub-hosted runners; it is never passed to
 #                        the Cursor cloud agent, never written into any committed file, and never sent
 #                        in the agent prompt. The cloud agent runs without registry credentials.
@@ -391,14 +390,11 @@ jobs:
             echo '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}'
           } > "$NPMRC"
           echo "NPM_CONFIG_USERCONFIG=$NPMRC" >> "$GITHUB_ENV"
-          # ui-myfinance .npmrc often uses ${NPM_TOKEN}; project config overrides userconfig.
-          echo "NPM_TOKEN=${NODE_AUTH_TOKEN}" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         working-directory: ui-myfinance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
-          NPM_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
         run: npm ci
 
       - name: Run codegen for drifted schemas
@@ -406,7 +402,6 @@ jobs:
         env:
           CHANGED_FILES: ${{ needs.detect-drift.outputs.changed_files }}
           NODE_AUTH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
-          NPM_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
         run: |
           set -euo pipefail
           MAP_FILE="$GITHUB_WORKSPACE/scripts/myfinance-schema-map.tsv"
@@ -847,13 +842,11 @@ jobs:
             echo '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}'
           } > "$NPMRC"
           echo "NPM_CONFIG_USERCONFIG=$NPMRC" >> "$GITHUB_ENV"
-          echo "NPM_TOKEN=${NODE_AUTH_TOKEN}" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         working-directory: ui-myfinance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
-          NPM_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
         run: npm ci
 
       - name: Typecheck
