@@ -73,7 +73,7 @@ on:
       model:
         description: "Cursor cloud-agent model. Pick '(default)' to use the org default."
         type: choice
-        default: claude-4.5-opus-high
+        default: composer-2
         options:
           - "(default)"
           - claude-4.5-opus-high
