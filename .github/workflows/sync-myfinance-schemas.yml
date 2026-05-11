@@ -13,6 +13,8 @@
 #                            GitHub’s message that the token does not match expected scopes — that is
 #                            missing registry permission on that package source, not a Cursor issue.
 #                            (Classic PAT alternative: read:packages for the org.)
+#                          * If the org enforces SAML SSO: authorize the PAT for the org in GitHub
+#                            (Fine-grained PAT → SSO → Configure SSO) or installs keep failing with 403.
 #                        The PAT is consumed exclusively by GitHub-hosted runners; it is never passed to
 #                        the Cursor cloud agent, never written into any committed file, and never sent
 #                        in the agent prompt. The cloud agent runs without registry credentials.
@@ -362,28 +364,30 @@ jobs:
             echo "version=lts/*" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Setup Node with @maersk-global registry auth
-        # setup-node writes its .npmrc to $RUNNER_TEMP and sets NPM_CONFIG_USERCONFIG
-        # to that path. Nothing lands in the checkout, so the credential reference
-        # cannot end up in any committed file. Use v6+ so npm is not fed deprecated
-        # always-auth user config (npm 11+ warns; v4 setup-node used to write it).
+      - name: Setup Node
         uses: actions/setup-node@v6
         with:
           node-version: ${{ steps.nodever.outputs.version }}
-          registry-url: https://npm.pkg.github.com
-          scope: '@maersk-global'
 
-      - name: Map @Maersk-Global scope to GitHub Packages
+      - name: Configure npm for GitHub Packages (Maersk scopes)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
         run: |
           set -euo pipefail
-          if [ -z "${NPM_CONFIG_USERCONFIG:-}" ] || [ ! -f "$NPM_CONFIG_USERCONFIG" ]; then
-            echo "::error::NPM_CONFIG_USERCONFIG missing after setup-node"
+          if [ -z "${NODE_AUTH_TOKEN}" ]; then
+            echo "::error::MAERSK_SCHEMAS_PAT is empty — cannot authenticate to npm.pkg.github.com."
             exit 1
           fi
-          # setup-node only registers @maersk-global; lockfiles often use @Maersk-Global/*.
-          if ! grep -q '^@Maersk-Global:registry=' "$NPM_CONFIG_USERCONFIG"; then
-            printf '\n@Maersk-Global:registry=https://npm.pkg.github.com\n' >> "$NPM_CONFIG_USERCONFIG"
-          fi
+          NPMRC="${RUNNER_TEMP}/gh-packages.npmrc"
+          # Do not use setup-node registry-url alone: ui-myfinance pulls both @maersk-global/*
+          # and @Maersk-Global/* from GPR; one scope line can leave the other without a token.
+          # ${NODE_AUTH_TOKEN} is expanded by npm from the environment (secret never echoed).
+          {
+            echo '@maersk-global:registry=https://npm.pkg.github.com'
+            echo '@Maersk-Global:registry=https://npm.pkg.github.com'
+            echo '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}'
+          } > "$NPMRC"
+          echo "NPM_CONFIG_USERCONFIG=$NPMRC" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         working-directory: ui-myfinance
@@ -435,9 +439,9 @@ jobs:
         working-directory: ui-myfinance
         run: |
           set -euo pipefail
-          # Defence in depth: setup-node writes .npmrc outside the checkout, but a
-          # buggy codegen script could conceivably write a token-bearing file into
-          # the working tree. Fail loudly before we even consider staging.
+          # Defence in depth: auth lives in $RUNNER_TEMP npm userconfig, but a buggy
+          # codegen script could conceivably write a token-bearing file into the
+          # working tree. Fail loudly before we even consider staging.
           LEAKED=$(git status --porcelain | awk '{print $2}' | grep -E '(^|/)\.npmrc$|(^|/)\.env(\..+)?$' || true)
           if [ -n "$LEAKED" ]; then
             echo "::error::Credential-shaped file detected in working tree after codegen: $LEAKED"
@@ -815,23 +819,27 @@ jobs:
             echo "version=lts/*" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Setup Node with @maersk-global registry auth
+      - name: Setup Node
         uses: actions/setup-node@v6
         with:
           node-version: ${{ steps.nodever.outputs.version }}
-          registry-url: https://npm.pkg.github.com
-          scope: '@maersk-global'
 
-      - name: Map @Maersk-Global scope to GitHub Packages
+      - name: Configure npm for GitHub Packages (Maersk scopes)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
         run: |
           set -euo pipefail
-          if [ -z "${NPM_CONFIG_USERCONFIG:-}" ] || [ ! -f "$NPM_CONFIG_USERCONFIG" ]; then
-            echo "::error::NPM_CONFIG_USERCONFIG missing after setup-node"
+          if [ -z "${NODE_AUTH_TOKEN}" ]; then
+            echo "::error::MAERSK_SCHEMAS_PAT is empty — cannot authenticate to npm.pkg.github.com."
             exit 1
           fi
-          if ! grep -q '^@Maersk-Global:registry=' "$NPM_CONFIG_USERCONFIG"; then
-            printf '\n@Maersk-Global:registry=https://npm.pkg.github.com\n' >> "$NPM_CONFIG_USERCONFIG"
-          fi
+          NPMRC="${RUNNER_TEMP}/gh-packages.npmrc"
+          {
+            echo '@maersk-global:registry=https://npm.pkg.github.com'
+            echo '@Maersk-Global:registry=https://npm.pkg.github.com'
+            echo '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}'
+          } > "$NPMRC"
+          echo "NPM_CONFIG_USERCONFIG=$NPMRC" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         working-directory: ui-myfinance
