@@ -6,8 +6,13 @@
 #                            (Write is required to push the pre-staged sync branch the Cloud Agent
 #                            checks out, the runner-side codegen commit, and for split-into-prs to push
 #                            child branches and open PRs via gh.)
-#                          * Packages: Read on Maersk-Global (used by run-codegen and verify-agent-output
-#                            jobs to authenticate `npm ci` for @maersk-global/* packages on GitHub Packages).
+#                          * Packages: Read on Maersk-Global/ui-myfinance **and on every other
+#                            Maersk-Global repository that publishes a private npm package** pulled by
+#                            ui-myfinance (for example the repo that publishes @Maersk-Global/vue-plugin-maerskvueapp).
+#                            Omitting a publisher repo yields HTTP 403 from npm.pkg.github.com with
+#                            GitHub’s message that the token does not match expected scopes — that is
+#                            missing registry permission on that package source, not a Cursor issue.
+#                            (Classic PAT alternative: read:packages for the org.)
 #                        The PAT is consumed exclusively by GitHub-hosted runners; it is never passed to
 #                        the Cursor cloud agent, never written into any committed file, and never sent
 #                        in the agent prompt. The cloud agent runs without registry credentials.
@@ -71,7 +76,7 @@ on:
       split_into_pr_per_schema:
         description: "Open one PR per drifted schema (umbrella + N children). Ignored when 'schema' is not '(all)'. Same agent token cost; PRs split deterministically afterwards."
         type: boolean
-        default: false
+        default: true
       dry_run:
         description: "CI-only dry-run: skips agent and any ui-myfinance push/PR; drift + planned codegen are in the dry-run-summary job (log + artifact)."
         type: boolean
@@ -360,13 +365,25 @@ jobs:
       - name: Setup Node with @maersk-global registry auth
         # setup-node writes its .npmrc to $RUNNER_TEMP and sets NPM_CONFIG_USERCONFIG
         # to that path. Nothing lands in the checkout, so the credential reference
-        # cannot end up in any committed file.
-        uses: actions/setup-node@v4
+        # cannot end up in any committed file. Use v6+ so npm is not fed deprecated
+        # always-auth user config (npm 11+ warns; v4 setup-node used to write it).
+        uses: actions/setup-node@v6
         with:
           node-version: ${{ steps.nodever.outputs.version }}
           registry-url: https://npm.pkg.github.com
           scope: '@maersk-global'
-          always-auth: true
+
+      - name: Map @Maersk-Global scope to GitHub Packages
+        run: |
+          set -euo pipefail
+          if [ -z "${NPM_CONFIG_USERCONFIG:-}" ] || [ ! -f "$NPM_CONFIG_USERCONFIG" ]; then
+            echo "::error::NPM_CONFIG_USERCONFIG missing after setup-node"
+            exit 1
+          fi
+          # setup-node only registers @maersk-global; lockfiles often use @Maersk-Global/*.
+          if ! grep -q '^@Maersk-Global:registry=' "$NPM_CONFIG_USERCONFIG"; then
+            printf '\n@Maersk-Global:registry=https://npm.pkg.github.com\n' >> "$NPM_CONFIG_USERCONFIG"
+          fi
 
       - name: Install dependencies
         working-directory: ui-myfinance
@@ -799,12 +816,22 @@ jobs:
           fi
 
       - name: Setup Node with @maersk-global registry auth
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: ${{ steps.nodever.outputs.version }}
           registry-url: https://npm.pkg.github.com
           scope: '@maersk-global'
-          always-auth: true
+
+      - name: Map @Maersk-Global scope to GitHub Packages
+        run: |
+          set -euo pipefail
+          if [ -z "${NPM_CONFIG_USERCONFIG:-}" ] || [ ! -f "$NPM_CONFIG_USERCONFIG" ]; then
+            echo "::error::NPM_CONFIG_USERCONFIG missing after setup-node"
+            exit 1
+          fi
+          if ! grep -q '^@Maersk-Global:registry=' "$NPM_CONFIG_USERCONFIG"; then
+            printf '\n@Maersk-Global:registry=https://npm.pkg.github.com\n' >> "$NPM_CONFIG_USERCONFIG"
+          fi
 
       - name: Install dependencies
         working-directory: ui-myfinance
