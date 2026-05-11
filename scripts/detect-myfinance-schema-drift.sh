@@ -131,7 +131,21 @@ stage_changes_to_ui_myfinance() {
 
   git -C "$UI_STAGE_DIR" add schemas/
   git -C "$UI_STAGE_DIR" commit -m "chore(schemas): sync myfinance YAMLs from API repo @ ${source_sha}"
-  git -C "$UI_STAGE_DIR" push --force-with-lease origin "$stage_branch"
+  # Shallow clone only knows the base ref. If $stage_branch already exists on
+  # the remote, --force-with-lease has no recorded expectation and aborts with
+  # "stale info". Fetch the remote ref first; if it exists, pass its SHA as
+  # the explicit lease expectation; otherwise plain push.
+  expected_sha=""
+  if git -C "$UI_STAGE_DIR" fetch origin "$stage_branch" 2>/dev/null; then
+    expected_sha=$(git -C "$UI_STAGE_DIR" rev-parse FETCH_HEAD)
+  fi
+  if [ -n "$expected_sha" ]; then
+    git -C "$UI_STAGE_DIR" push \
+      --force-with-lease="refs/heads/$stage_branch:$expected_sha" \
+      origin "$stage_branch"
+  else
+    git -C "$UI_STAGE_DIR" push origin "$stage_branch"
+  fi
 
   echo "STAGE_BRANCH=$stage_branch" >&2
   echo "AGENT_STARTING_REF=$stage_branch" >&2

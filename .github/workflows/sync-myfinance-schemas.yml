@@ -285,7 +285,22 @@ jobs:
             git -C /tmp/ui-stage commit -m "chore(schemas): sync myfinance YAMLs from API repo @ ${SOURCE_SHA}"
             git -C /tmp/ui-stage remote set-url origin \
               "https://x-access-token:${GH_TOKEN}@github.com/${UI_REPO}.git"
-            git -C /tmp/ui-stage push --force-with-lease origin "$STAGE_BRANCH"
+            # The shallow clone only knows BASE_REF, so --force-with-lease has no
+            # recorded expectation for STAGE_BRANCH and fails with "stale info" if
+            # the branch already exists on the remote (e.g., re-run with same
+            # source SHA). Fetch the ref first; if it exists, pass the fetched
+            # SHA as the explicit lease expectation; otherwise plain push.
+            EXPECTED_SHA=""
+            if git -C /tmp/ui-stage fetch origin "$STAGE_BRANCH" 2>/dev/null; then
+              EXPECTED_SHA=$(git -C /tmp/ui-stage rev-parse FETCH_HEAD)
+            fi
+            if [ -n "$EXPECTED_SHA" ]; then
+              git -C /tmp/ui-stage push \
+                --force-with-lease="refs/heads/$STAGE_BRANCH:$EXPECTED_SHA" \
+                origin "$STAGE_BRANCH"
+            else
+              git -C /tmp/ui-stage push origin "$STAGE_BRANCH"
+            fi
 
             echo "staged_branch=$STAGE_BRANCH" >> "$GITHUB_OUTPUT"
             echo "agent_starting_ref=$STAGE_BRANCH" >> "$GITHUB_OUTPUT"
@@ -739,7 +754,20 @@ jobs:
               continue
             fi
 
-            git push --force-with-lease "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$CHILD"
+            # Same "stale info" guard as in detect-drift: if the child branch
+            # already exists on the remote (e.g., re-run), the lease needs an
+            # explicit expectation. Otherwise plain push.
+            CHILD_EXPECTED=""
+            if git fetch "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$CHILD" 2>/dev/null; then
+              CHILD_EXPECTED=$(git rev-parse FETCH_HEAD)
+            fi
+            if [ -n "$CHILD_EXPECTED" ]; then
+              git push \
+                --force-with-lease="refs/heads/$CHILD:$CHILD_EXPECTED" \
+                "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$CHILD"
+            else
+              git push "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$CHILD"
+            fi
 
             PR_TITLE="feat(${sc}): myfinance UI sync (API @ ${SHORT_SHA})"
             if [ "$sc" = "shared" ]; then
