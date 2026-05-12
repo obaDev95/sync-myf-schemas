@@ -626,6 +626,9 @@ jobs:
         id: launch
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          # GH_TOKEN powers the post-run fallback that queries ui-myfinance for
+          # the agent's cursor/* branch when the Cursor API omits branchName.
+          GH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
           AGENT_STARTING_REF: ${{ needs.detect-drift.outputs.agent_starting_ref }}
           SPLIT_PR: ${{ inputs.split_into_pr_per_schema }}
           SCHEMA_IN: ${{ inputs.schema }}
@@ -748,11 +751,17 @@ jobs:
             esac
           done
 
-          # Resolve branchName now that the run has FINISHED. Try the run
-          # payload first (some Cursor responses surface it there), then fall
-          # back to GET /v1/agents/{id}. Only fail when split-into-prs needs
-          # it; in autoCreatePR=true mode the downstream job is skipped and
-          # an empty agent_branch output is harmless.
+          # Resolve branchName now that the run has FINISHED. Cursor's API has
+          # been observed to push the agent's branch to ui-myfinance without
+          # populating any branchName field in the agent/run payloads, so we
+          # cascade through three sources:
+          #   1. Run JSON (.branchName, .agent.branchName)
+          #   2. Fresh GET /v1/agents/{id} (.agent.branchName, .branchName)
+          #   3. GitHub branch search: list cursor/* branches on ui-myfinance
+          #      and pick the one whose tip is 'ahead' of staged_branch. Since
+          #      staged_branch is unique per source SHA, only the current run's
+          #      agent branch can compare as ahead — older cursor/* branches
+          #      forked from prior staged refs will compare as diverged/behind.
           if [ -z "$BRANCH" ] || [ "$BRANCH" = "null" ]; then
             BRANCH=$(echo "$RUN_JSON" | jq -r '.branchName // .agent.branchName // empty')
           fi
@@ -762,11 +771,43 @@ jobs:
             BRANCH=$(jq -r '.agent.branchName // .branchName // empty' /tmp/agent.json 2>/dev/null || echo "")
           fi
           if [ -z "$BRANCH" ] || [ "$BRANCH" = "null" ]; then
+            echo "Cursor API did not expose branchName; falling back to GitHub branch search."
+            # Diagnostic dumps so a future regression can be triaged without re-dispatching.
+            echo "--- Final run JSON ---"
+            echo "$RUN_JSON" | jq .
+            echo "--- Final agent JSON ---"
+            jq . /tmp/agent.json 2>/dev/null || echo "(no agent.json captured)"
+            echo "--- end diagnostic ---"
+
+            # List cursor/* branches and find one ahead of the staged branch.
+            # Pagination caps at 100/page; ui-myfinance is unlikely to have
+            # thousands of stale cursor/* branches, but if it does, the loop
+            # still terminates on the first 'ahead' match.
+            CANDIDATES=$(gh api "repos/${UI_REPO}/branches" --paginate \
+              --jq '.[] | select(.name | startswith("cursor/")) | .name' 2>/dev/null || echo "")
+            if [ -z "$CANDIDATES" ]; then
+              echo "::warning::No cursor/* branches found on ${UI_REPO}."
+            else
+              echo "Candidate cursor/* branches on ${UI_REPO}:"
+              echo "$CANDIDATES" | sed 's/^/  - /'
+              while IFS= read -r candidate; do
+                [ -z "$candidate" ] && continue
+                STATUS=$(gh api "repos/${UI_REPO}/compare/${STAGED_IN}...${candidate}" \
+                  --jq '.status' 2>/dev/null || echo "")
+                if [ "$STATUS" = "ahead" ]; then
+                  BRANCH="$candidate"
+                  echo "Resolved agent branch via GitHub: $BRANCH (ahead of $STAGED_IN)"
+                  break
+                fi
+              done <<< "$CANDIDATES"
+            fi
+          fi
+          if [ -z "$BRANCH" ] || [ "$BRANCH" = "null" ]; then
             if [ "$AUTO_CREATE_PR" != "true" ]; then
-              echo "::error::Run FINISHED but Cursor never exposed agent.branchName; split-into-prs cannot cherry-pick. Open the agent URL: $AGENT_URL"
+              echo "::error::Run FINISHED but could not resolve the agent branch via Cursor API or GitHub fallback; split-into-prs cannot cherry-pick. The agent may have produced no commits — check the agent URL: $AGENT_URL"
               exit 1
             fi
-            echo "::warning::Cursor did not expose agent.branchName; continuing because autoCreatePR=true and split-into-prs is skipped."
+            echo "::warning::Branch resolution failed; continuing because autoCreatePR=true and split-into-prs is skipped."
             BRANCH=""
           fi
           echo "agent_branch=$BRANCH" >> "$GITHUB_OUTPUT"
