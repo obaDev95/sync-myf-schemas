@@ -929,9 +929,16 @@ jobs:
         run: |
           set -euo pipefail
 
+          # bash 5.x mis-parses an inline regex with parens here:
+          #   if [[ "$sub" =~ ^(type)\(([^)]+)\): ]]
+          # produces "syntax error in conditional expression: unexpected token `)'".
+          # The fix is to bind the regex to a variable first — bash then defers
+          # paren handling to the regex engine where it belongs. The pattern is
+          # unchanged.
+          conv_scope_regex='^(feat|fix|test|chore|refactor|docs|style|perf|ci|build)\(([^)]+)\):'
           scope_from_subject() {
             local sub="$1"
-            if [[ "$sub" =~ ^(feat|fix|test|chore|refactor|docs|style|perf|ci|build)\(([^)]+)\): ]]; then
+            if [[ "$sub" =~ $conv_scope_regex ]]; then
               echo "${BASH_REMATCH[2]}"
               return 0
             fi
