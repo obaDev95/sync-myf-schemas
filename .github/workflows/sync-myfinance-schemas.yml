@@ -1011,15 +1011,26 @@ jobs:
             exit 0
           fi
 
-          # Group commit SHAs by scope (order within each scope = chronological)
-          GROUPS='{}'
+          # Group commit SHAs by scope, preserving chronological order within
+          # each scope. We previously kept this state as a JSON object rebuilt
+          # per-iteration via `jq ... '.[$s] = (.[$s] // []) + [$h]'`, but any
+          # single jq invocation that emitted non-object output (observed in
+          # CI as "Cannot index number with string ...") would corrupt GROUPS
+          # for every subsequent iteration. Bash associative arrays remove the
+          # cross-iteration JSON dependency entirely.
+          declare -A SCOPE_TO_SHAS=()
+          SCOPES=()
           for c in "${COMMITS[@]}"; do
             sub=$(git log -1 --format=%s "$c")
             sc=$(scope_from_subject "$sub")
-            GROUPS=$(echo "$GROUPS" | jq --arg s "$sc" --arg h "$c" '.[$s] = (.[$s] // []) + [$h]')
+            if [ -z "${SCOPE_TO_SHAS[$sc]+x}" ]; then
+              SCOPES+=("$sc")
+              SCOPE_TO_SHAS[$sc]=""
+            fi
+            SCOPE_TO_SHAS[$sc]+="${c}"$'\n'
           done
 
-          mapfile -t SCOPES < <(echo "$GROUPS" | jq -r 'keys[]')
+          echo "Scopes detected: ${SCOPES[*]}"
 
           FAILURES=0
           # Track child branch names within this run so two long scopes that
@@ -1045,7 +1056,7 @@ jobs:
             fi
             SEEN_CHILD["$CHILD"]="$sc"
 
-            mapfile -t SHA_LIST < <(echo "$GROUPS" | jq -r --arg s "$sc" '.[$s][]')
+            mapfile -t SHA_LIST < <(printf '%s' "${SCOPE_TO_SHAS[$sc]}")
 
             echo ""
             echo "=== Scope: $sc -> branch $CHILD (${#SHA_LIST[@]} commits) ==="
