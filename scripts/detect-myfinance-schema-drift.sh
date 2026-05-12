@@ -148,7 +148,6 @@ stage_changes_to_ui_myfinance() {
   fi
 
   echo "STAGE_BRANCH=$stage_branch" >&2
-  echo "AGENT_STARTING_REF=$stage_branch" >&2
 }
 
 clone_api_repo

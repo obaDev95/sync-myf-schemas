@@ -8,7 +8,6 @@ for it in this environment.
 - SCHEMA:                    ${SCHEMA}                    # `(all)` or one local schema filename under `schemas/`
 - SPLIT_INTO_PR_PER_SCHEMA:  ${SPLIT_INTO_PR_PER_SCHEMA}  # `true` when CI will split your commits into one PR per Conventional Commit scope after the run (see Commit rules below)
 - SELECTED_SCHEMAS:          ${SELECTED_SCHEMAS}          # JSON array of schema slugs for drifted files (e.g. `["invoices-v1","estatements"]`) — use these as commit scopes when split is enabled
-- DRY_RUN:                   ${DRY_RUN}                   # `true` in CI means the Cloud Agent is **not** launched; drift + planned codegen are in the GitHub Actions summary and `sync-myfinance-dry-run-report` artifact only (no `SYNC_REPORT.md`, no ui-myfinance commits)
 - Triggered by:              ${ACTOR}
 - CHANGED_FILES:             ${CHANGED_FILES}             # JSON array — each entry is `{ "remote": "<path in API repo>", "local": "<path in schemas/>", "status": "added|modified|deleted" }`
 - SOURCE_SHA:                ${SOURCE_SHA}                # commit of the API repo CI synced from
@@ -18,7 +17,7 @@ for it in this environment.
 - **Never invent or simulate schema YAML or API content.** If you cannot complete a required
   step (missing file, unexpected diff shape, etc.), stop, make a single commit with message
   `chore(sync): aborted due to <short reason>`, and state in the PR body that the run **aborted**
-  and why. Do not fabricate files to “complete” the workflow.
+  and why. Do not fabricate files to "complete" the workflow.
 - **Do not re-clone** `Maersk-Global/API-JSON-Schema-Definitions` or assume it is public.
 - **Never run `npm` commands of any kind** — no `npm ci`, no `npm install`, no `npm run codegen-*`,
   no `npm run typecheck`, no `npm run test:unit`. You have **no registry credentials** in this
@@ -29,9 +28,7 @@ for it in this environment.
   encounter one in the working tree, do not stage it, do not echo it, do not mention its
   contents in any commit message or PR body.
 
-## Branch and schema state (depends on DRY_RUN)
-
-### When `DRY_RUN` is not `true` (normal run)
+## Branch and schema state
 
 CI has already pushed a branch you are checked out on. **Tip of `HEAD` includes two automated
 commits:**
@@ -40,33 +37,24 @@ commits:**
 - `HEAD~1` — `chore(schemas): sync myfinance YAMLs from API repo @ …` (updated `schemas/`)
 - `HEAD~2` — the pre-sync baseline (previous schema + previous generated client)
 
-- To inspect what changed for a given schema YAML:
+To inspect what changed for a given schema YAML:
 
 ```bash
 git diff HEAD~2 HEAD~1 -- schemas/<filename>
 ```
 
-- To inspect what regenerated client output looks like vs. the previous state:
+To inspect what regenerated client output looks like vs. the previous state:
 
 ```bash
 git diff HEAD~1 HEAD
 ```
 
-- For **deleted** schemas, the file is gone on `HEAD`; use `git show HEAD~2:schemas/<filename>`
-  if you need the old content.
-
-You **must not** run codegen yourself — the `chore(codegen):` commit already contains the
-regenerated client. Build on top of `HEAD`.
-
-### When `DRY_RUN` is `true`
-
-CI **does not launch** this agent and does **not** create `SYNC_REPORT.md` or any commit in `ui-myfinance`. Use the workflow run’s **Dry-run report** job: step summary plus artifact `sync-myfinance-dry-run-report` for drift tables and planned `npm run codegen-*` commands. If you are reading this prompt outside that path (manual agent), treat as a normal run regarding branch state unless you have been instructed otherwise.
-
-Do **not** run codegen, change UI code, push, or open a PR unless an operator explicitly asked for a non–dry-run run.
+For **deleted** schemas, the file is gone on `HEAD`; use `git show HEAD~2:schemas/<filename>`
+if you need the old content. Build on top of `HEAD` — never re-run codegen (Hard rules).
 
 ## Schema slug reference (for `SPLIT_INTO_PR_PER_SCHEMA=true`)
 
-> Source of truth: [`scripts/myfinance-schema-map.tsv`](../../scripts/myfinance-schema-map.tsv) in the automation repo. The two tables below are mirrors; if they ever disagree with the TSV, trust the TSV.
+> Source of truth: [`scripts/myfinance-schema-map.tsv`](../../scripts/myfinance-schema-map.tsv) in the automation repo. The table below is a mirror; if it ever disagrees with the TSV, trust the TSV.
 
 Use these **exact** scopes in commit messages when split mode is on. They must match
 `SELECTED_SCHEMAS` for the files you touch in each commit.
@@ -83,22 +71,11 @@ Use these **exact** scopes in commit messages when split mode is on. They must m
 
 Cross-cutting changes (shared util, barrel file, or a single edit that clearly serves more than one schema slug above) must use scope **`shared`**: `chore(shared): …` or `feat(shared): …` as appropriate.
 
-## Schema → codegen script mapping (reference only — **CI runs these, not you**)
+## Schema → codegen script mapping (reference)
 
 CI runs the matching `npm run codegen-*` script for every drifted schema on the GitHub-hosted
 runner before you start, using credentials you do not have access to. The regenerated output
-is already on `HEAD` as the `chore(codegen):` commit. The table below is retained only so you
-can confirm which script produced which generated files when inspecting diffs.
-
-| Local schema file                                      | npm script (CI-run)                  |
-|--------------------------------------------------------|--------------------------------------|
-| `schemas/myfinance-invoices-API.v1.yml`                | `codegen-invoices`                   |
-| `schemas/myfinance-invoices-API.v2.yaml`               | `codegen-invoices-v2`                |
-| `schemas/myfinance-submit-proof-of-payment-API.v1.yaml`| `codegen-proof-of-payment`           |
-| `schemas/myfinance-export-documents-API.v1.yml`        | `codegen-export-documents`           |
-| `schemas/myfinance-refund-request-API.v1.yaml`         | `codegen-refund-request`             |
-| `schemas/myfinance-estatements-API.v1.yml`             | `codegen-estatements`                |
-| `schemas/myfinance-workflows-API.v1.yaml`              | `codegen-workflows`                  |
+is already on `HEAD` as the `chore(codegen):` commit. Column 4 of [`scripts/myfinance-schema-map.tsv`](../../scripts/myfinance-schema-map.tsv) records which script produced which generated files; consult it if you need to attribute pieces of the `chore(codegen):` diff.
 
 ## Steps
 
@@ -110,17 +87,11 @@ list with statuses. Parse CHANGED_FILES as JSON and use it directly.
 
 When `SCHEMA` is not `(all)`, CHANGED_FILES will contain only that one file (if it drifted).
 
-### 2. Dry-run (CI vs agent)
-
-In **GitHub Actions**, `DRY_RUN=true` means there is **no** Cloud Agent step: drift, ADDED/MODIFIED/DELETED, and planned `npm run codegen-*` commands are emitted in the **Dry-run report** job (workflow step summary + artifact `sync-myfinance-dry-run-report`). Do not add `SYNC_REPORT.md` or any other file to `ui-myfinance` for dry-run.
-
-If you are executing this prompt **manually** with `DRY_RUN=true`, still **do not** invent a repo report file unless operators ask: prefer pasting the same sections into the PR or ticket. Do not run codegen or edit product code until dry-run is lifted.
-
-### 3. Codegen is done — confirm, don't re-run
+### 2. Codegen is done — confirm, don't re-run
 
 CI has already executed every applicable `npm run codegen-*` script and committed the result
-as the `chore(codegen):` commit at `HEAD`. **Do not run codegen yourself.** You have no
-registry credentials. Confirm the regenerated client is present by inspecting:
+as the `chore(codegen):` commit at `HEAD`. **Do not run codegen yourself.** Confirm the
+regenerated client is present by inspecting:
 
 ```bash
 git log -1 --oneline HEAD
@@ -133,7 +104,7 @@ abort rule (Hard rules). Do not attempt to compensate.
 If a drifted schema was unmapped, CI will have emitted a `::warning::` in the workflow log;
 list any such file under "Unmapped files" in the PR description.
 
-### 4. Adapt the UI to the schema diff (mandatory when not dry-run)
+### 3. Adapt the UI to the schema diff
 
 For each **modified** schema, compare against the pre-sync baseline:
 
@@ -145,11 +116,11 @@ The regenerated client diff (`HEAD~1..HEAD`) is your reference for what the new 
 client surface look like — read it to see what API the UI now has to call.
 
 For **added** schemas, treat the whole file as new on `HEAD~1`. For **removed** schemas, remove
-UI and test usage as in 4c.
+UI and test usage as in 3c.
 
 Then apply the matching code changes:
 
-#### 4a. Renamed properties (`oldName` → `newName`)
+#### 3a. Renamed properties (`oldName` → `newName`)
 
 - Search the entire repo for the literal `oldName` in `.ts`, `.vue`,
   `.spec.ts`, `.cy.ts`, JSON mocks, fixtures, and storybook files.
@@ -163,7 +134,7 @@ Then apply the matching code changes:
   cross-file `grep` for the old identifier to catch missed references;
   CI runs typecheck on your final branch and will surface any remaining hit.
 
-#### 4b. Added properties
+#### 3b. Added properties
 
 - Always type them in the generated client / interface.
 - Decide UI surfacing per property:
@@ -175,13 +146,13 @@ Then apply the matching code changes:
 - Document each surfacing decision in the PR description under
   "New properties surfaced".
 
-#### 4c. Removed / deprecated properties
+#### 3c. Removed / deprecated properties
 
 - Delete references in templates, components, stores, tests, mocks, fixtures.
 - Confirm the UI still renders without the field (no broken bindings, no
   `undefined` in templates, no orphan i18n keys).
 
-#### 4d. Type-only changes
+#### 3d. Type-only changes
 
 (`string` → `string | null`, enum value added/removed, required → optional)
 
@@ -189,7 +160,7 @@ Then apply the matching code changes:
 - Add null-handling in templates and computed properties where needed.
 - Update enum-driven UI (selects, badges, color maps) to handle new values.
 
-#### 4e. Tests, mocks, fixtures
+#### 3e. Tests, mocks, fixtures
 
 - Update Vitest mocks, MSW handlers, Cypress fixtures, and any hard-coded
   JSON in tests to match the new shape.
@@ -202,7 +173,7 @@ should be surfaced), add a `// TODO(cursor-sync):` comment, leave the type
 but skip the UI surfacing, and call it out in the PR description under
 "Decisions deferred to reviewer".
 
-### 5. Verification runs in CI — not here
+### 4. Verification runs in CI — not here
 
 You **must not** run `npm run typecheck` or `npm run test:unit` (no registry credentials).
 After you push, the workflow's `verify-agent-output` job runs both on the GitHub-hosted runner
@@ -210,7 +181,7 @@ against your final branch and surfaces failures as PR checks. Reviewers see red 
 breakage. If you spot something genuinely ambiguous during your edits, leave a
 `// TODO(cursor-sync):` comment and call it out in the PR description.
 
-### 6. Commit (when not dry-run)
+### 5. Commit
 
 Use logical chunks with Conventional Commits:
 
@@ -224,6 +195,8 @@ Every commit subject **must** be `type(scope): description` where `type` is one 
 - one of the slugs from **Schema slug reference** above (matching the schema file that commit primarily concerns), or
 - `shared` for cross-cutting work.
 
+CI hard-fails the split job if any commit subject is missing a Conventional Commit scope, or if the scope is not in the allowed set (TSV slugs + `shared`). There is no silent fallback — surface ambiguity as `shared` or stop and abort per Hard rules.
+
 Examples: `feat(invoices-v1): adapt invoices table to new fields`, `test(estatements): update fixtures`, `chore(shared): fix shared date util used by invoices and estatements`.
 
 **When `SPLIT_INTO_PR_PER_SCHEMA` is not `true`** (single combined PR)
@@ -233,13 +206,13 @@ Use area-style scopes as before:
 - `feat(<area>): adapt <area> to schema changes` (one per affected area)
 - `test(<area>): update fixtures for schema changes` (if needed)
 
-### 7. PR body
+### 6. PR body
 
 When Cursor opens the PR automatically (`autoCreatePR: true` — the default when split mode is off), include:
 
 - Source commit SHA: `${SOURCE_SHA}`.
 - The three file sets (ADDED / MODIFIED / DELETED).
-- A note that codegen was run by CI on the runner (see the `chore(codegen):` commit on this branch); the dry-run job lists the planned scripts when no agent ran.
+- A note that codegen was run by CI on the runner (see the `chore(codegen):` commit on this branch).
 - **Scopes used** — list every Conventional Commit scope you used (`invoices-v1`, `shared`, etc.) so reviewers and automation can audit split mode.
 - **Renamed properties** table: `oldName | newName | files touched`.
 - **New properties surfaced** table: `property | UI surface(s) | rationale`.
