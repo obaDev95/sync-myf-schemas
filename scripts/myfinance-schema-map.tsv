@@ -1,8 +1,8 @@
 # Source of truth for myfinance schema mapping.
 # Consumed by:
-#   .github/workflows/sync-myfinance-schemas.yml  (detect-drift slug emission, dry-run-summary codegen plan)
+#   .github/workflows/sync-myfinance-schemas.yml  (detect-drift slug emission + all-slugs allowlist, run-codegen script lookup, split-into-prs scope validation)
 #   scripts/detect-myfinance-schema-drift.sh      (local parity)
-#   .cursor/prompts/sync-myfinance-schemas.md     (slug + codegen tables — must match this file)
+#   .cursor/prompts/sync-myfinance-schemas.md     (slug table — must match column 3 of this file)
 #
 # Columns (TAB-separated, blank lines and lines starting with `#` are skipped):
 #   1. remote_path     Path in Maersk-Global/API-JSON-Schema-Definitions

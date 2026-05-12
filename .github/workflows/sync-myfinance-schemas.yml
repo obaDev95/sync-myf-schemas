@@ -36,9 +36,9 @@
 # PR creation: autoCreatePR opens a GitHub PR only after the Cloud Agent run reaches FINISHED.
 # If the run ends in ERROR (wrong startingRef, push denied, etc.), no PR appears — check the agent URL.
 #
-# When split_into_pr_per_schema is true (and schema is "(all)", non–dry-run, staged branch exists),
-# autoCreatePR is false and job split-into-prs opens an umbrella PR (default <- staged branch)
-# plus one PR per Conventional Commit scope (staged <- child branch) using cherry-picks.
+# When split_into_pr_per_schema is true and schema is "(all)", autoCreatePR is false and the
+# split-into-prs job opens an umbrella PR (default <- staged branch) plus one PR per Conventional
+# Commit scope (staged <- child branch) using cherry-picks.
 
 name: Sync myfinance schemas (Cursor agent)
 
@@ -78,13 +78,9 @@ on:
           - myfinance-estatements-API.v1.yml
           - myfinance-workflows-API.v1.yaml
       split_into_pr_per_schema:
-        description: "Open one PR per drifted schema (umbrella + N children). Ignored when 'schema' is not '(all)'. Same agent token cost; PRs split deterministically afterwards."
+        description: "Open one PR per drifted schema (umbrella + N children). Only effective when 'schema' is '(all)'; ignored otherwise. Same agent token cost; PRs split deterministically afterwards."
         type: boolean
         default: true
-      dry_run:
-        description: "CI-only dry-run: skips agent and any ui-myfinance push/PR; drift + planned codegen are in the dry-run-summary job (log + artifact)."
-        type: boolean
-        default: false
       model:
         description: "Cursor cloud-agent model. Pick '(default)' to use the org default."
         type: choice
@@ -97,14 +93,13 @@ on:
           - claude-4-sonnet-thinking
           - composer-2
           - gpt-5-codex-high
-          - o3
 jobs:
   # ──────────────────────────────────────────────────────────────────────
   # Job 1: Deterministic pre-flight gate.
   # Clones API-JSON-Schema-Definitions (org-private) and sparse-checks out
   # ui-myfinance/schemas/, diffs tracked YAMLs, and emits a JSON change list.
-  # When drift exists and dry_run is false, pushes sync/myfinance-schemas-<sha>
-  # to ui-myfinance so the Cloud Agent never clones the API repo.
+  # When drift exists, pushes sync/myfinance-schemas-<sha> to ui-myfinance
+  # so the Cloud Agent never clones the API repo.
   # If nothing drifted the workflow ends here — zero Cursor tokens spent.
   # ──────────────────────────────────────────────────────────────────────
   detect-drift:
@@ -114,10 +109,10 @@ jobs:
       has_changes: ${{ steps.diff.outputs.has_changes }}
       changed_files: ${{ steps.diff.outputs.changed_files }}
       selected_schemas: ${{ steps.diff.outputs.selected_schemas }}
+      all_slugs: ${{ steps.diff.outputs.all_slugs }}
       source_sha: ${{ steps.diff.outputs.source_sha }}
       base_ref: ${{ steps.diff.outputs.base_ref }}
       staged_branch: ${{ steps.diff.outputs.staged_branch }}
-      agent_starting_ref: ${{ steps.diff.outputs.agent_starting_ref }}
     steps:
       - uses: actions/checkout@v4
 
@@ -142,7 +137,6 @@ jobs:
         id: diff
         env:
           SCHEMA_INPUT: ${{ inputs.schema }}
-          DRY_RUN: ${{ inputs.dry_run }}
           GH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
         run: |
           set -euo pipefail
@@ -160,12 +154,18 @@ jobs:
 
           declare -A SLUG_BY_LOCAL
           MAPPING=""
+          ALL_SLUGS='[]'
           while IFS=$'\t' read -r remote_rel local_name slug _codegen; do
             [ -z "${remote_rel:-}" ] && continue
             case "$remote_rel" in \#*) continue ;; esac
             MAPPING+="${remote_rel}"$'\t'"${local_name}"$'\n'
             SLUG_BY_LOCAL["$local_name"]="$slug"
+            ALL_SLUGS=$(echo "$ALL_SLUGS" | jq --arg s "$slug" '. + [$s]')
           done < "$MAP_FILE"
+          ALL_SLUGS=$(echo "$ALL_SLUGS" | jq 'unique')
+          # all_slugs is the closed set of allowed Conventional Commit scopes
+          # consumed by split-into-prs to validate agent commits.
+          echo "all_slugs=$(echo "$ALL_SLUGS" | jq -c '.')" >> "$GITHUB_OUTPUT"
 
           CHANGES='[]'
 
@@ -252,7 +252,7 @@ jobs:
             echo "$CHANGES" | jq -r '.[] | select(.status == "deleted")  | "- `\(.local)`"'
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # Base ref for ui-myfinance (fork point + dry-run agent checkout)
+          # Base ref for ui-myfinance (fork point for the staged branch)
           BASE_REF=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
@@ -263,67 +263,57 @@ jobs:
           SHORT_SHA="${SOURCE_SHA:0:7}"
           STAGE_BRANCH="sync/myfinance-schemas-${SHORT_SHA}"
 
-          if [ "${DRY_RUN}" = "true" ]; then
-            echo "staged_branch=" >> "$GITHUB_OUTPUT"
-            echo "agent_starting_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
-            {
-              echo ""
-              echo "**Dry run:** no schema branch pushed; **Launch Cursor agent** job is skipped. See job **Dry-run report (no agent)** for the markdown artifact and extended summary (no commits to ui-myfinance)."
-            } >> "$GITHUB_STEP_SUMMARY"
-          else
-            rm -rf /tmp/ui-stage
-            git clone --depth=1 -b "$BASE_REF" \
-              "https://x-access-token:${GH_TOKEN}@github.com/${UI_REPO}" \
-              /tmp/ui-stage
-            git -C /tmp/ui-stage config user.email "github-actions[bot]@users.noreply.github.com"
-            git -C /tmp/ui-stage config user.name "github-actions[bot]"
-            git -C /tmp/ui-stage checkout -b "$STAGE_BRANCH"
+          rm -rf /tmp/ui-stage
+          git clone --depth=1 -b "$BASE_REF" \
+            "https://x-access-token:${GH_TOKEN}@github.com/${UI_REPO}" \
+            /tmp/ui-stage
+          git -C /tmp/ui-stage config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C /tmp/ui-stage config user.name "github-actions[bot]"
+          git -C /tmp/ui-stage checkout -b "$STAGE_BRANCH"
 
-            while IFS= read -r row; do
-              status=$(echo "$row" | jq -r .status)
-              remote_rel=$(echo "$row" | jq -r .remote)
-              local_name=$(echo "$row" | jq -r .local)
-              case "$status" in
-                added|modified)
-                  mkdir -p /tmp/ui-stage/schemas
-                  cp "$SRC/$remote_rel" "/tmp/ui-stage/schemas/$local_name"
-                  ;;
-                deleted)
-                  if [ -f "/tmp/ui-stage/schemas/$local_name" ]; then
-                    git -C /tmp/ui-stage rm -f "schemas/$local_name"
-                  fi
-                  ;;
-              esac
-            done < <(echo "$CHANGES" | jq -c '.[]')
+          while IFS= read -r row; do
+            status=$(echo "$row" | jq -r .status)
+            remote_rel=$(echo "$row" | jq -r .remote)
+            local_name=$(echo "$row" | jq -r .local)
+            case "$status" in
+              added|modified)
+                mkdir -p /tmp/ui-stage/schemas
+                cp "$SRC/$remote_rel" "/tmp/ui-stage/schemas/$local_name"
+                ;;
+              deleted)
+                if [ -f "/tmp/ui-stage/schemas/$local_name" ]; then
+                  git -C /tmp/ui-stage rm -f "schemas/$local_name"
+                fi
+                ;;
+            esac
+          done < <(echo "$CHANGES" | jq -c '.[]')
 
-            git -C /tmp/ui-stage add schemas/
-            git -C /tmp/ui-stage commit -m "chore(schemas): sync myfinance YAMLs from API repo @ ${SOURCE_SHA}"
-            git -C /tmp/ui-stage remote set-url origin \
-              "https://x-access-token:${GH_TOKEN}@github.com/${UI_REPO}.git"
-            # The shallow clone only knows BASE_REF, so --force-with-lease has no
-            # recorded expectation for STAGE_BRANCH and fails with "stale info" if
-            # the branch already exists on the remote (e.g., re-run with same
-            # source SHA). Fetch the ref first; if it exists, pass the fetched
-            # SHA as the explicit lease expectation; otherwise plain push.
-            EXPECTED_SHA=""
-            if git -C /tmp/ui-stage fetch origin "$STAGE_BRANCH" 2>/dev/null; then
-              EXPECTED_SHA=$(git -C /tmp/ui-stage rev-parse FETCH_HEAD)
-            fi
-            if [ -n "$EXPECTED_SHA" ]; then
-              git -C /tmp/ui-stage push \
-                --force-with-lease="refs/heads/$STAGE_BRANCH:$EXPECTED_SHA" \
-                origin "$STAGE_BRANCH"
-            else
-              git -C /tmp/ui-stage push origin "$STAGE_BRANCH"
-            fi
-
-            echo "staged_branch=$STAGE_BRANCH" >> "$GITHUB_OUTPUT"
-            echo "agent_starting_ref=$STAGE_BRANCH" >> "$GITHUB_OUTPUT"
-            {
-              echo ""
-              echo "**Pre-staged branch pushed:** \`$STAGE_BRANCH\` (Cloud Agent \`startingRef\`). Tip of branch will include the \`chore(schemas):\` commit plus a \`chore(codegen):\` commit pushed by the next job."
-            } >> "$GITHUB_STEP_SUMMARY"
+          git -C /tmp/ui-stage add schemas/
+          git -C /tmp/ui-stage commit -m "chore(schemas): sync myfinance YAMLs from API repo @ ${SOURCE_SHA}"
+          git -C /tmp/ui-stage remote set-url origin \
+            "https://x-access-token:${GH_TOKEN}@github.com/${UI_REPO}.git"
+          # The shallow clone only knows BASE_REF, so --force-with-lease has no
+          # recorded expectation for STAGE_BRANCH and fails with "stale info" if
+          # the branch already exists on the remote (e.g., re-run with same
+          # source SHA). Fetch the ref first; if it exists, pass the fetched
+          # SHA as the explicit lease expectation; otherwise plain push.
+          EXPECTED_SHA=""
+          if git -C /tmp/ui-stage fetch origin "$STAGE_BRANCH" 2>/dev/null; then
+            EXPECTED_SHA=$(git -C /tmp/ui-stage rev-parse FETCH_HEAD)
           fi
+          if [ -n "$EXPECTED_SHA" ]; then
+            git -C /tmp/ui-stage push \
+              --force-with-lease="refs/heads/$STAGE_BRANCH:$EXPECTED_SHA" \
+              origin "$STAGE_BRANCH"
+          else
+            git -C /tmp/ui-stage push origin "$STAGE_BRANCH"
+          fi
+
+          echo "staged_branch=$STAGE_BRANCH" >> "$GITHUB_OUTPUT"
+          {
+            echo ""
+            echo "**Pre-staged branch pushed:** \`$STAGE_BRANCH\` (Cloud Agent \`startingRef\`). Tip of branch will include the \`chore(schemas):\` commit plus a \`chore(codegen):\` commit pushed by the next job."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ──────────────────────────────────────────────────────────────────────
   # Job 1b: Run codegen on the GitHub-hosted runner (NOT in the Cursor sandbox).
@@ -338,7 +328,7 @@ jobs:
     name: Run codegen on runner (no agent secrets)
     runs-on: ubuntu-latest
     needs: detect-drift
-    if: needs.detect-drift.outputs.has_changes == 'true' && inputs.dry_run != 'true'
+    if: needs.detect-drift.outputs.has_changes == 'true'
     steps:
       - uses: actions/checkout@v4
 
@@ -354,48 +344,10 @@ jobs:
           git -C ui-myfinance config user.email "github-actions[bot]@users.noreply.github.com"
           git -C ui-myfinance config user.name "github-actions[bot]"
 
-      - name: Resolve Node version
-        id: nodever
-        run: |
-          set -euo pipefail
-          # Honour ui-myfinance's pinned Node when present; fall back to LTS so a
-          # missing .nvmrc doesn't silently break codegen on an unpinned major.
-          if [ -f ui-myfinance/.nvmrc ]; then
-            echo "version=$(cat ui-myfinance/.nvmrc)" >> "$GITHUB_OUTPUT"
-          else
-            echo "version=lts/*" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Setup Node
-        uses: actions/setup-node@v6
+      - uses: ./.github/actions/setup-myf-runner
         with:
-          node-version: ${{ steps.nodever.outputs.version }}
-
-      - name: Configure npm for GitHub Packages (Maersk scopes)
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
-        run: |
-          set -euo pipefail
-          if [ -z "${NODE_AUTH_TOKEN}" ]; then
-            echo "::error::MAERSK_SCHEMAS_PAT is empty — cannot authenticate to npm.pkg.github.com."
-            exit 1
-          fi
-          NPMRC="${RUNNER_TEMP}/gh-packages.npmrc"
-          # Do not use setup-node registry-url alone: ui-myfinance pulls both @maersk-global/*
-          # and @Maersk-Global/* from GPR; one scope line can leave the other without a token.
-          # ${NODE_AUTH_TOKEN} is expanded by npm from the environment (secret never echoed).
-          {
-            echo '@maersk-global:registry=https://npm.pkg.github.com'
-            echo '@Maersk-Global:registry=https://npm.pkg.github.com'
-            echo '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}'
-          } > "$NPMRC"
-          echo "NPM_CONFIG_USERCONFIG=$NPMRC" >> "$GITHUB_ENV"
-
-      - name: Install dependencies
-        working-directory: ui-myfinance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
-        run: npm ci
+          working-directory: ui-myfinance
+          gh-token: ${{ secrets.MAERSK_SCHEMAS_PAT }}
 
       - name: Run codegen for drifted schemas
         working-directory: ui-myfinance
@@ -484,107 +436,12 @@ jobs:
             origin "$STAGED_BRANCH"
 
   # ──────────────────────────────────────────────────────────────────────
-  # Job 2a: Dry-run only — CI report from detect-drift outputs (no agent, no ui-myfinance changes).
-  # ──────────────────────────────────────────────────────────────────────
-  dry-run-summary:
-    name: Dry-run report (no agent)
-    runs-on: ubuntu-latest
-    needs: detect-drift
-    if: needs.detect-drift.outputs.has_changes == 'true' && inputs.dry_run == 'true'
-    steps:
-      - name: Write dry-run summary and artifact
-        env:
-          CHANGED_FILES: ${{ needs.detect-drift.outputs.changed_files }}
-          SOURCE_SHA: ${{ needs.detect-drift.outputs.source_sha }}
-          BASE_REF: ${{ needs.detect-drift.outputs.base_ref }}
-          SCHEMA_INPUT: ${{ inputs.schema }}
-        run: |
-          set -euo pipefail
-
-          # Codegen mapping comes from the same source-of-truth TSV detect-drift uses,
-          # so the dry-run summary cannot drift away from the live mapping.
-          MAP_FILE="$GITHUB_WORKSPACE/scripts/myfinance-schema-map.tsv"
-          if [ ! -f "$MAP_FILE" ]; then
-            echo "::error::Schema map file missing: $MAP_FILE"
-            exit 1
-          fi
-
-          declare -A CODEGEN_BY_LOCAL
-          while IFS=$'\t' read -r _remote local_name _slug codegen; do
-            [ -z "${local_name:-}" ] && continue
-            case "${_remote}" in \#*) continue ;; esac
-            CODEGEN_BY_LOCAL["$local_name"]="$codegen"
-          done < "$MAP_FILE"
-
-          codegen_for_local() {
-            local cg="${CODEGEN_BY_LOCAL[$1]:-}"
-            if [ -z "$cg" ]; then
-              echo "_unmapped — add to scripts/myfinance-schema-map.tsv_"
-            else
-              echo "\`npm run ${cg}\`"
-            fi
-          }
-
-          REPORT_FILE="$RUNNER_TEMP/sync-myfinance-dry-run.md"
-          {
-            echo "## Dry-run: sync myfinance schemas"
-            echo ""
-            echo "No Cloud Agent run and **no commits or pushes** to \`${UI_REPO}\`. This file mirrors the workflow step summary."
-            echo ""
-            echo "| | |"
-            echo "|---|---|"
-            echo "| API source SHA | \`$SOURCE_SHA\` |"
-            echo "| ui-myfinance base ref | \`$BASE_REF\` |"
-            echo "| Schema filter | \`$SCHEMA_INPUT\` |"
-            echo ""
-            echo "### Drift (from CI \`CHANGED_FILES\`)"
-            echo ""
-          } > "$REPORT_FILE"
-
-          for status in added modified deleted; do
-            echo "#### ${status^}" >> "$REPORT_FILE"
-            rows=$(echo "$CHANGED_FILES" | jq -c --arg s "$status" '[.[] | select(.status == $s)]')
-            n=$(echo "$rows" | jq 'length')
-            if [ "$n" -eq 0 ]; then
-              echo "_None._" >> "$REPORT_FILE"
-            else
-              echo "" >> "$REPORT_FILE"
-              echo "| Local file | Remote (API repo) | Planned codegen (normal run) |" >> "$REPORT_FILE"
-              echo "|------------|-------------------|------------------------------|" >> "$REPORT_FILE"
-              while IFS= read -r row; do
-                local_name=$(echo "$row" | jq -r .local)
-                remote=$(echo "$row" | jq -r .remote)
-                if [ "$status" = "deleted" ]; then
-                  plan="_remove UI usage; no codegen_"
-                else
-                  plan=$(codegen_for_local "$local_name")
-                fi
-                echo "| \`$local_name\` | \`$remote\` | $plan |" >> "$REPORT_FILE"
-              done < <(echo "$rows" | jq -c '.[]')
-            fi
-            echo "" >> "$REPORT_FILE"
-          done
-
-          {
-            echo "### What a normal run would do next"
-            echo ""
-            echo "After codegen, the Cloud Agent adapts UI, tests, and fixtures per \`.cursor/prompts/sync-myfinance-schemas.md\` (not executed in dry-run)."
-            echo ""
-          } >> "$REPORT_FILE"
-
-          cat "$REPORT_FILE" >> "$GITHUB_STEP_SUMMARY"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sync-myfinance-dry-run-report
-          path: ${{ runner.temp }}/sync-myfinance-dry-run.md
-
-  # ──────────────────────────────────────────────────────────────────────
   # Job 2: Launch the Cursor Cloud Agent.
   # Only runs when detect-drift found at least one changed file.
   # Embeds the pre-computed change list and source SHA into the prompt
   # so the agent skips re-enumeration entirely.
-  # Skipped when dry_run: drift report is CI-only (dry-run-summary job).
+  # Split into discrete steps (build prompt / create / poll / resolve / summary)
+  # so the Actions UI attributes failures to the actual sub-task.
   # ──────────────────────────────────────────────────────────────────────
   launch-agent:
     name: Launch Cursor agent
@@ -594,18 +451,17 @@ jobs:
     # registry auth issue), the agent is never invoked — saves Cursor tokens and
     # keeps the failure signal where the root cause actually is.
     needs: [detect-drift, run-codegen]
-    if: needs.detect-drift.outputs.has_changes == 'true' && inputs.dry_run != 'true'
+    if: needs.detect-drift.outputs.has_changes == 'true'
     outputs:
-      agent_branch: ${{ steps.launch.outputs.agent_branch }}
+      agent_branch: ${{ steps.resolve-branch.outputs.branch }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build prompt
+      - name: Build agent prompt
         env:
           SCHEMA: ${{ inputs.schema }}
           SPLIT_INTO_PR_PER_SCHEMA: ${{ inputs.split_into_pr_per_schema }}
           SELECTED_SCHEMAS: ${{ needs.detect-drift.outputs.selected_schemas }}
-          DRY_RUN: ${{ inputs.dry_run }}
           ACTOR: ${{ github.actor }}
           CHANGED_FILES: ${{ needs.detect-drift.outputs.changed_files }}
           SOURCE_SHA: ${{ needs.detect-drift.outputs.source_sha }}
@@ -615,41 +471,28 @@ jobs:
           # this, any `$IDENT` later added to the markdown (e.g. inside a code
           # block illustrating a shell command) would be silently consumed.
           PROMPT=$(envsubst \
-            '$SCHEMA $SPLIT_INTO_PR_PER_SCHEMA $SELECTED_SCHEMAS $DRY_RUN $ACTOR $CHANGED_FILES $SOURCE_SHA' \
+            '$SCHEMA $SPLIT_INTO_PR_PER_SCHEMA $SELECTED_SCHEMAS $ACTOR $CHANGED_FILES $SOURCE_SHA' \
             < .cursor/prompts/sync-myfinance-schemas.md)
           # Write to a file — do not pass the prompt via GITHUB_OUTPUT or inline
           # workflow expressions into the next step's shell; JSON/markdown/newlines/braces
           # break the runner script if inlined.
-          printf '%s\n' "$PROMPT" > /tmp/agent-prompt.txt
+          printf '%s\n' "$PROMPT" > "$RUNNER_TEMP/agent-prompt.txt"
 
-      - name: Launch Cursor agent
-        id: launch
+      - name: Create Cursor agent
+        id: create-agent
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
-          # GH_TOKEN powers the post-run fallback that queries ui-myfinance for
-          # the agent's cursor/* branch when the Cursor API omits branchName.
-          GH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
-          AGENT_STARTING_REF: ${{ needs.detect-drift.outputs.agent_starting_ref }}
+          STAGED_BRANCH: ${{ needs.detect-drift.outputs.staged_branch }}
           SPLIT_PR: ${{ inputs.split_into_pr_per_schema }}
           SCHEMA_IN: ${{ inputs.schema }}
-          DRY_RUN_IN: ${{ inputs.dry_run }}
-          STAGED_IN: ${{ needs.detect-drift.outputs.staged_branch }}
           MODEL_INPUT: ${{ inputs.model }}
-          CHANGED_FILES_JSON: ${{ needs.detect-drift.outputs.changed_files }}
         run: |
           set -euo pipefail
 
-          REF="${AGENT_STARTING_REF}"
-          echo "Using Cloud Agent startingRef: $REF"
-
           AUTO_CREATE_PR=true
-          if [ "${SPLIT_PR}" = "true" ] && [ "${SCHEMA_IN}" = "(all)" ] && [ "${DRY_RUN_IN}" != "true" ] && [ -n "${STAGED_IN}" ]; then
+          if [ "${SPLIT_PR}" = "true" ] && [ "${SCHEMA_IN}" = "(all)" ]; then
             AUTO_CREATE_PR=false
             echo "split_into_pr_per_schema: disabling Cursor autoCreatePR (split-into-prs will open PRs)."
-          fi
-          # This job is skipped when dry_run is true; if that guard is removed, never auto-open a PR from dry-run.
-          if [ "${DRY_RUN_IN}" = "true" ]; then
-            AUTO_CREATE_PR=false
           fi
 
           ACP_JSON=true
@@ -658,33 +501,34 @@ jobs:
           # Build the POST body on disk; piping a large rawfile prompt through
           # echo | jq breaks for prompts containing certain control sequences.
           jq -n \
-            --rawfile text /tmp/agent-prompt.txt \
+            --rawfile text "$RUNNER_TEMP/agent-prompt.txt" \
             --arg repo "https://github.com/${UI_REPO}" \
-            --arg ref "$REF" \
+            --arg ref "$STAGED_BRANCH" \
             --argjson acp "$ACP_JSON" \
             '{
               prompt: { text: $text },
               repos: [{ url: $repo, startingRef: $ref }],
               autoCreatePR: $acp
-            }' > /tmp/create-agent-body.json
+            }' > "$RUNNER_TEMP/create-agent-body.json"
 
           if [ "${MODEL_INPUT}" != "(default)" ] && [ -n "${MODEL_INPUT}" ]; then
-            jq --arg m "${MODEL_INPUT}" '. + { model: { id: $m } }' /tmp/create-agent-body.json > /tmp/create-agent-body.json.tmp
-            mv /tmp/create-agent-body.json.tmp /tmp/create-agent-body.json
+            jq --arg m "${MODEL_INPUT}" '. + { model: { id: $m } }' \
+              "$RUNNER_TEMP/create-agent-body.json" > "$RUNNER_TEMP/create-agent-body.json.tmp"
+            mv "$RUNNER_TEMP/create-agent-body.json.tmp" "$RUNNER_TEMP/create-agent-body.json"
           fi
 
-          jq -e . /tmp/create-agent-body.json >/dev/null
-          echo "Create-agent POST body top-level keys: $(jq -c 'keys | sort' /tmp/create-agent-body.json)"
+          jq -e . "$RUNNER_TEMP/create-agent-body.json" >/dev/null
+          echo "Create-agent POST body top-level keys: $(jq -c 'keys | sort' "$RUNNER_TEMP/create-agent-body.json")"
 
           # Retry only on transient failures (network errors, 5xx, 429). 4xx
           # responses indicate a bad payload and will not become valid by
           # waiting; surface those immediately.
           HTTP_CODE=""
           for attempt in 1 2 3; do
-            HTTP_CODE=$(curl -sS -o /tmp/create-agent.json -w "%{http_code}" -X POST https://api.cursor.com/v1/agents \
+            HTTP_CODE=$(curl -sS -o "$RUNNER_TEMP/create-agent.json" -w "%{http_code}" -X POST https://api.cursor.com/v1/agents \
               -u "${CURSOR_API_KEY}:" \
               -H 'Content-Type: application/json' \
-              --data-binary @/tmp/create-agent-body.json || echo "000")
+              --data-binary @"$RUNNER_TEMP/create-agent-body.json" || echo "000")
             if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
               break
             fi
@@ -700,24 +544,37 @@ jobs:
             esac
           done
 
-          jq . /tmp/create-agent.json
+          jq . "$RUNNER_TEMP/create-agent.json"
           if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
             echo "::error::Cursor POST /v1/agents failed with HTTP $HTTP_CODE after retries"
-            echo "Request top-level keys (for support / debugging): $(jq -c 'keys | sort' /tmp/create-agent-body.json)"
+            echo "Request top-level keys (for support / debugging): $(jq -c 'keys | sort' "$RUNNER_TEMP/create-agent-body.json")"
             exit 1
           fi
 
-          AGENT_ID=$(jq -r '.agent.id' /tmp/create-agent.json)
-          RUN_ID=$(jq -r '.run.id' /tmp/create-agent.json)
-          AGENT_URL=$(jq -r '.agent.url // "unknown"' /tmp/create-agent.json)
+          AGENT_ID=$(jq -r '.agent.id' "$RUNNER_TEMP/create-agent.json")
+          RUN_ID=$(jq -r '.run.id' "$RUNNER_TEMP/create-agent.json")
+          AGENT_URL=$(jq -r '.agent.url // "unknown"' "$RUNNER_TEMP/create-agent.json")
           # branchName is NOT populated at POST time — the agent is in status
           # CREATING and Cursor only assigns a working branch once the run has
           # actually checked out source. Capture whatever is there now (usually
           # empty); we re-resolve it after the polling loop reaches FINISHED.
-          BRANCH=$(jq -r '.agent.branchName // empty' /tmp/create-agent.json)
+          INITIAL_BRANCH=$(jq -r '.agent.branchName // empty' "$RUNNER_TEMP/create-agent.json")
 
-          FILE_COUNT=$(printf '%s' "$CHANGED_FILES_JSON" | jq 'length')
+          echo "agent_id=$AGENT_ID" >> "$GITHUB_OUTPUT"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "agent_url=$AGENT_URL" >> "$GITHUB_OUTPUT"
+          echo "initial_branch=$INITIAL_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "auto_create_pr=$AUTO_CREATE_PR" >> "$GITHUB_OUTPUT"
 
+      - name: Poll Cursor run until terminal
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          AGENT_ID: ${{ steps.create-agent.outputs.agent_id }}
+          RUN_ID: ${{ steps.create-agent.outputs.run_id }}
+          AGENT_URL: ${{ steps.create-agent.outputs.agent_url }}
+          AUTO_CREATE_PR: ${{ steps.create-agent.outputs.auto_create_pr }}
+        run: |
+          set -euo pipefail
           # Poll until a terminal status; overall wall clock is bounded by the runner job timeout.
           # Cadence scales with elapsed time so a quick FINISHED/ERROR is observed within seconds
           # while long-running cases don't burn API calls every 30s for an hour.
@@ -734,6 +591,8 @@ jobs:
                 else
                   echo "Run FINISHED — split-into-prs job will open umbrella + per-scope PRs."
                 fi
+                # Persist the final run JSON for the resolve-branch step.
+                printf '%s' "$RUN_JSON" > "$RUNNER_TEMP/run-final.json"
                 break
                 ;;
               ERROR|CANCELLED|EXPIRED)
@@ -751,32 +610,45 @@ jobs:
             esac
           done
 
+      - name: Resolve agent branch
+        id: resolve-branch
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          GH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
+          AGENT_ID: ${{ steps.create-agent.outputs.agent_id }}
+          INITIAL_BRANCH: ${{ steps.create-agent.outputs.initial_branch }}
+          AGENT_URL: ${{ steps.create-agent.outputs.agent_url }}
+          STAGED_BRANCH: ${{ needs.detect-drift.outputs.staged_branch }}
+        run: |
+          set -euo pipefail
           # Resolve branchName now that the run has FINISHED. Cursor's API has
           # been observed to push the agent's branch to ui-myfinance without
           # populating any branchName field in the agent/run payloads, so we
           # cascade through three sources:
-          #   1. Run JSON (.branchName, .agent.branchName)
+          #   1. Run JSON saved by poll step (.branchName, .agent.branchName)
           #   2. Fresh GET /v1/agents/{id} (.agent.branchName, .branchName)
           #   3. GitHub branch search: list cursor/* branches on ui-myfinance
           #      and pick the one whose tip is 'ahead' of staged_branch. Since
           #      staged_branch is unique per source SHA, only the current run's
           #      agent branch can compare as ahead — older cursor/* branches
           #      forked from prior staged refs will compare as diverged/behind.
+          BRANCH="$INITIAL_BRANCH"
+
           if [ -z "$BRANCH" ] || [ "$BRANCH" = "null" ]; then
-            BRANCH=$(echo "$RUN_JSON" | jq -r '.branchName // .agent.branchName // empty')
+            BRANCH=$(jq -r '.branchName // .agent.branchName // empty' "$RUNNER_TEMP/run-final.json")
           fi
           if [ -z "$BRANCH" ] || [ "$BRANCH" = "null" ]; then
-            curl -sS -o /tmp/agent.json -u "${CURSOR_API_KEY}:" \
+            curl -sS -o "$RUNNER_TEMP/agent.json" -u "${CURSOR_API_KEY}:" \
               "https://api.cursor.com/v1/agents/${AGENT_ID}" || true
-            BRANCH=$(jq -r '.agent.branchName // .branchName // empty' /tmp/agent.json 2>/dev/null || echo "")
+            BRANCH=$(jq -r '.agent.branchName // .branchName // empty' "$RUNNER_TEMP/agent.json" 2>/dev/null || echo "")
           fi
           if [ -z "$BRANCH" ] || [ "$BRANCH" = "null" ]; then
             echo "Cursor API did not expose branchName; falling back to GitHub branch search."
             # Diagnostic dumps so a future regression can be triaged without re-dispatching.
             echo "--- Final run JSON ---"
-            echo "$RUN_JSON" | jq .
+            jq . "$RUNNER_TEMP/run-final.json"
             echo "--- Final agent JSON ---"
-            jq . /tmp/agent.json 2>/dev/null || echo "(no agent.json captured)"
+            jq . "$RUNNER_TEMP/agent.json" 2>/dev/null || echo "(no agent.json captured)"
             echo "--- end diagnostic ---"
 
             # List cursor/* branches and find one ahead of the staged branch.
@@ -792,33 +664,47 @@ jobs:
               echo "$CANDIDATES" | sed 's/^/  - /'
               while IFS= read -r candidate; do
                 [ -z "$candidate" ] && continue
-                STATUS=$(gh api "repos/${UI_REPO}/compare/${STAGED_IN}...${candidate}" \
+                STATUS=$(gh api "repos/${UI_REPO}/compare/${STAGED_BRANCH}...${candidate}" \
                   --jq '.status' 2>/dev/null || echo "")
                 if [ "$STATUS" = "ahead" ]; then
                   BRANCH="$candidate"
-                  echo "Resolved agent branch via GitHub: $BRANCH (ahead of $STAGED_IN)"
+                  echo "Resolved agent branch via GitHub: $BRANCH (ahead of $STAGED_BRANCH)"
                   break
                 fi
               done <<< "$CANDIDATES"
             fi
           fi
-          if [ -z "$BRANCH" ] || [ "$BRANCH" = "null" ]; then
-            if [ "$AUTO_CREATE_PR" != "true" ]; then
-              echo "::error::Run FINISHED but could not resolve the agent branch via Cursor API or GitHub fallback; split-into-prs cannot cherry-pick. The agent may have produced no commits — check the agent URL: $AGENT_URL"
-              exit 1
-            fi
-            echo "::warning::Branch resolution failed; continuing because autoCreatePR=true and split-into-prs is skipped."
-            BRANCH=""
-          fi
-          echo "agent_branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
+          # Fail-closed: regardless of autoCreatePR, an unresolved branch means
+          # verify-agent-output can't validate (it gates on this output) and any
+          # PR Cursor opens would ship without runner-side typecheck + unit tests
+          # — a real correctness gap. Error instead of warn-and-continue.
+          if [ -z "$BRANCH" ] || [ "$BRANCH" = "null" ]; then
+            echo "::error::Run FINISHED but could not resolve the agent branch via Cursor API or GitHub fallback. The agent may have produced no commits — check the agent URL: $AGENT_URL"
+            exit 1
+          fi
+
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Write run summary
+        env:
+          AGENT_URL: ${{ steps.create-agent.outputs.agent_url }}
+          RUN_ID: ${{ steps.create-agent.outputs.run_id }}
+          AUTO_CREATE_PR: ${{ steps.create-agent.outputs.auto_create_pr }}
+          BRANCH: ${{ steps.resolve-branch.outputs.branch }}
+          STAGED_BRANCH: ${{ needs.detect-drift.outputs.staged_branch }}
+          SOURCE_SHA: ${{ needs.detect-drift.outputs.source_sha }}
+          CHANGED_FILES: ${{ needs.detect-drift.outputs.changed_files }}
+        run: |
+          set -euo pipefail
+          FILE_COUNT=$(printf '%s' "$CHANGED_FILES" | jq 'length')
           {
             echo "### Cursor agent"
             echo "- Target repo (PR opens here): **${UI_REPO}**"
             echo "- Agent: $AGENT_URL"
             echo "- Run: \`$RUN_ID\`"
-            echo "- Branch: \`$BRANCH\` (Cursor \`startingRef\`: \`$REF\`)"
-            echo "- Source SHA (API schemas): \`${{ needs.detect-drift.outputs.source_sha }}\`"
+            echo "- Branch: \`$BRANCH\` (Cursor \`startingRef\`: \`$STAGED_BRANCH\`)"
+            echo "- Source SHA (API schemas): \`$SOURCE_SHA\`"
             echo "- Files passed in: $FILE_COUNT YAML(s)"
             echo "- autoCreatePR: \`$AUTO_CREATE_PR\`"
             echo ""
@@ -836,12 +722,15 @@ jobs:
     name: Verify agent output (typecheck + unit tests)
     runs-on: ubuntu-latest
     needs: [detect-drift, launch-agent]
+    # launch-agent now fails closed when the agent branch is unresolved, so
+    # a successful launch-agent guarantees a non-empty agent_branch output;
+    # no separate guard for that here.
     if: |
       needs.detect-drift.outputs.has_changes == 'true' &&
-      inputs.dry_run != 'true' &&
-      needs.launch-agent.result == 'success' &&
-      needs.launch-agent.outputs.agent_branch != ''
+      needs.launch-agent.result == 'success'
     steps:
+      - uses: actions/checkout@v4
+
       - name: Clone ui-myfinance at agent branch
         env:
           GH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
@@ -852,43 +741,10 @@ jobs:
             "https://x-access-token:${GH_TOKEN}@github.com/${UI_REPO}" \
             ui-myfinance
 
-      - name: Resolve Node version
-        id: nodever
-        run: |
-          set -euo pipefail
-          if [ -f ui-myfinance/.nvmrc ]; then
-            echo "version=$(cat ui-myfinance/.nvmrc)" >> "$GITHUB_OUTPUT"
-          else
-            echo "version=lts/*" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Setup Node
-        uses: actions/setup-node@v6
+      - uses: ./.github/actions/setup-myf-runner
         with:
-          node-version: ${{ steps.nodever.outputs.version }}
-
-      - name: Configure npm for GitHub Packages (Maersk scopes)
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
-        run: |
-          set -euo pipefail
-          if [ -z "${NODE_AUTH_TOKEN}" ]; then
-            echo "::error::MAERSK_SCHEMAS_PAT is empty — cannot authenticate to npm.pkg.github.com."
-            exit 1
-          fi
-          NPMRC="${RUNNER_TEMP}/gh-packages.npmrc"
-          {
-            echo '@maersk-global:registry=https://npm.pkg.github.com'
-            echo '@Maersk-Global:registry=https://npm.pkg.github.com'
-            echo '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}'
-          } > "$NPMRC"
-          echo "NPM_CONFIG_USERCONFIG=$NPMRC" >> "$GITHUB_ENV"
-
-      - name: Install dependencies
-        working-directory: ui-myfinance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
-        run: npm ci
+          working-directory: ui-myfinance
+          gh-token: ${{ secrets.MAERSK_SCHEMAS_PAT }}
 
       - name: Typecheck
         working-directory: ui-myfinance
@@ -903,6 +759,8 @@ jobs:
   # grouped by Conventional Commit scope onto child branches and opens PRs
   # with base = staged sync branch. Also ensures an umbrella PR exists:
   # default_branch <- staged_branch (schema YAML only on staged tip).
+  # Split into named steps so checkout / umbrella-PR / cherry-pick failures
+  # are attributed to the right phase in the Actions UI.
   # ──────────────────────────────────────────────────────────────────────
   split-into-prs:
     name: Split agent work into per-schema PRs
@@ -912,48 +770,20 @@ jobs:
       needs.detect-drift.outputs.has_changes == 'true' &&
       needs.launch-agent.result == 'success' &&
       inputs.split_into_pr_per_schema == true &&
-      inputs.schema == '(all)' &&
-      inputs.dry_run == false &&
-      needs.detect-drift.outputs.staged_branch != ''
+      inputs.schema == '(all)'
     env:
       GH_TOKEN: ${{ secrets.MAERSK_SCHEMAS_PAT }}
     steps:
-      - name: Cherry-pick by scope and open PRs
-        shell: bash
+      - name: Checkout ui-myfinance and verify branches
+        id: checkout
         env:
           STAGED_BRANCH: ${{ needs.detect-drift.outputs.staged_branch }}
           AGENT_BRANCH: ${{ needs.launch-agent.outputs.agent_branch }}
-          BASE_REF: ${{ needs.detect-drift.outputs.base_ref }}
-          SOURCE_SHA: ${{ needs.detect-drift.outputs.source_sha }}
-          SELECTED_SCHEMAS: ${{ needs.detect-drift.outputs.selected_schemas }}
         run: |
           set -euo pipefail
-
-          # bash 5.x mis-parses an inline regex with parens here:
-          #   if [[ "$sub" =~ ^(type)\(([^)]+)\): ]]
-          # produces "syntax error in conditional expression: unexpected token `)'".
-          # The fix is to bind the regex to a variable first — bash then defers
-          # paren handling to the regex engine where it belongs. The pattern is
-          # unchanged.
-          conv_scope_regex='^(feat|fix|test|chore|refactor|docs|style|perf|ci|build)\(([^)]+)\):'
-          scope_from_subject() {
-            local sub="$1"
-            if [[ "$sub" =~ $conv_scope_regex ]]; then
-              echo "${BASH_REMATCH[2]}"
-              return 0
-            fi
-            echo "shared"
-            echo "::warning::Commit subject has no Conventional scope; treating as shared: $sub" >&2
-            return 0
-          }
-
-          REPO="${UI_REPO}"
-          SHORT_SHA="${SOURCE_SHA:0:7}"
-
-
           rm -rf /tmp/ui-split
           git clone --no-single-branch \
-            "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" \
+            "https://x-access-token:${GH_TOKEN}@github.com/${UI_REPO}.git" \
             /tmp/ui-split
           cd /tmp/ui-split
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -975,12 +805,22 @@ jobs:
           echo "Staged: ${STAGED_BRANCH} @ ${STAGED_SHA}"
           echo "Agent:  ${AGENT_BRANCH} @ ${AGENT_SHA}"
 
-          # ── Umbrella PR: BASE_REF <- STAGED_BRANCH (schema sync only until children merge)
+          echo "staged_sha=$STAGED_SHA" >> "$GITHUB_OUTPUT"
+          echo "agent_sha=$AGENT_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure umbrella PR exists
+        env:
+          STAGED_BRANCH: ${{ needs.detect-drift.outputs.staged_branch }}
+          BASE_REF: ${{ needs.detect-drift.outputs.base_ref }}
+          SOURCE_SHA: ${{ needs.detect-drift.outputs.source_sha }}
+          SELECTED_SCHEMAS: ${{ needs.detect-drift.outputs.selected_schemas }}
+        run: |
+          set -euo pipefail
           # Check across all states (open, closed, merged). If a previous run created an
           # umbrella for the same staged branch and it was closed without merging — e.g.
           # operator cancelled mid-flight — gh pr create would otherwise fail the whole
           # split job. Reuse the existing PR record and warn instead of creating a duplicate.
-          EXISTING=$(gh pr list -R "$REPO" --base "$BASE_REF" --head "$STAGED_BRANCH" --state all --json number,state -q '.[0]' || echo "")
+          EXISTING=$(gh pr list -R "${UI_REPO}" --base "$BASE_REF" --head "$STAGED_BRANCH" --state all --json number,state -q '.[0]' || echo "")
           if [ -z "${EXISTING}" ]; then
             printf '%s\n' \
               "Automated schema sync from API-JSON-Schema-Definitions @ \`${SOURCE_SHA}\`." \
@@ -988,12 +828,12 @@ jobs:
               "Child PRs (one per Conventional Commit scope) target branch \`${STAGED_BRANCH}\` after the Cloud Agent run when **split_into_pr_per_schema** is enabled." \
               "" \
               "**Slugs in this run:** \`${SELECTED_SCHEMAS}\`" \
-              > /tmp/umbrella-body.md
-            gh pr create -R "$REPO" \
+              > "$RUNNER_TEMP/umbrella-body.md"
+            gh pr create -R "${UI_REPO}" \
               --base "$BASE_REF" \
               --head "$STAGED_BRANCH" \
               --title "chore(schemas): sync myfinance YAMLs from API @ ${SOURCE_SHA}" \
-              --body-file /tmp/umbrella-body.md
+              --body-file "$RUNNER_TEMP/umbrella-body.md"
           else
             EX_NUM=$(echo "$EXISTING" | jq -r '.number')
             EX_STATE=$(echo "$EXISTING" | jq -r '.state')
@@ -1003,7 +843,55 @@ jobs:
             fi
           fi
 
-          # ── Collect agent commits (exclude merges)
+      - name: Cherry-pick by scope and open per-scope PRs
+        env:
+          STAGED_BRANCH: ${{ needs.detect-drift.outputs.staged_branch }}
+          AGENT_BRANCH: ${{ needs.launch-agent.outputs.agent_branch }}
+          STAGED_SHA: ${{ steps.checkout.outputs.staged_sha }}
+          AGENT_SHA: ${{ steps.checkout.outputs.agent_sha }}
+          SOURCE_SHA: ${{ needs.detect-drift.outputs.source_sha }}
+          BASE_REF: ${{ needs.detect-drift.outputs.base_ref }}
+          ALL_SLUGS: ${{ needs.detect-drift.outputs.all_slugs }}
+        run: |
+          set -euo pipefail
+          cd /tmp/ui-split
+
+          # Build the closed set of allowed Conventional Commit scopes: every slug
+          # registered in scripts/myfinance-schema-map.tsv, plus "shared". An agent
+          # commit with any other scope is a regression — fail loudly rather than
+          # bucket it incorrectly and confuse reviewers.
+          declare -A ALLOWED_SCOPES=()
+          ALLOWED_SCOPES["shared"]=1
+          while IFS= read -r slug; do
+            [ -z "$slug" ] && continue
+            ALLOWED_SCOPES["$slug"]=1
+          done < <(echo "$ALL_SLUGS" | jq -r '.[]')
+
+          # bash 5.x mis-parses an inline regex with parens here:
+          #   if [[ "$sub" =~ ^(type)\(([^)]+)\): ]]
+          # produces "syntax error in conditional expression: unexpected token `)'".
+          # The fix is to bind the regex to a variable first — bash then defers
+          # paren handling to the regex engine where it belongs. The pattern is
+          # unchanged.
+          conv_scope_regex='^(feat|fix|test|chore|refactor|docs|style|perf|ci|build)\(([^)]+)\):'
+          scope_from_subject() {
+            local sub="$1"
+            if [[ "$sub" =~ $conv_scope_regex ]]; then
+              local sc="${BASH_REMATCH[2]}"
+              if [ -n "${ALLOWED_SCOPES[$sc]:-}" ]; then
+                echo "$sc"
+                return 0
+              fi
+              echo "::error::Commit scope '$sc' is not in the allowed set (TSV slugs + 'shared'). Subject: $sub" >&2
+              return 1
+            fi
+            echo "::error::Commit subject has no Conventional Commit scope: $sub" >&2
+            return 1
+          }
+
+          SHORT_SHA="${SOURCE_SHA:0:7}"
+
+          # Collect agent commits (exclude merges)
           mapfile -t COMMITS < <(git rev-list --no-merges --reverse "${STAGED_SHA}..${AGENT_SHA}")
 
           if [ "${#COMMITS[@]}" -eq 0 ]; then
@@ -1022,7 +910,9 @@ jobs:
           SCOPES=()
           for c in "${COMMITS[@]}"; do
             sub=$(git log -1 --format=%s "$c")
-            sc=$(scope_from_subject "$sub")
+            if ! sc=$(scope_from_subject "$sub"); then
+              exit 1
+            fi
             if [ -z "${SCOPE_TO_SHAS[$sc]+x}" ]; then
               SCOPES+=("$sc")
               SCOPE_TO_SHAS[$sc]=""
@@ -1033,6 +923,7 @@ jobs:
           echo "Scopes detected: ${SCOPES[*]}"
 
           FAILURES=0
+          FAILED_SCOPES=()
           # Track child branch names within this run so two long scopes that
           # share a 60-char prefix can't silently produce the same branch and
           # have one PR overwrite another.
@@ -1075,6 +966,7 @@ jobs:
                 git cherry-pick --abort 2>/dev/null || true
                 ok=false
                 FAILURES=$((FAILURES + 1))
+                FAILED_SCOPES+=("$sc")
                 break
               fi
             done
@@ -1089,15 +981,15 @@ jobs:
             # already exists on the remote (e.g., re-run), the lease needs an
             # explicit expectation. Otherwise plain push.
             CHILD_EXPECTED=""
-            if git fetch "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$CHILD" 2>/dev/null; then
+            if git fetch "https://x-access-token:${GH_TOKEN}@github.com/${UI_REPO}.git" "$CHILD" 2>/dev/null; then
               CHILD_EXPECTED=$(git rev-parse FETCH_HEAD)
             fi
             if [ -n "$CHILD_EXPECTED" ]; then
               git push \
                 --force-with-lease="refs/heads/$CHILD:$CHILD_EXPECTED" \
-                "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$CHILD"
+                "https://x-access-token:${GH_TOKEN}@github.com/${UI_REPO}.git" "$CHILD"
             else
-              git push "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$CHILD"
+              git push "https://x-access-token:${GH_TOKEN}@github.com/${UI_REPO}.git" "$CHILD"
             fi
 
             PR_TITLE="feat(${sc}): myfinance UI sync (API @ ${SHORT_SHA})"
@@ -1115,17 +1007,13 @@ jobs:
               "- **Commits:** ${COMMIT_LINE}" \
               "" \
               "_Merge after review. If this PR conflicts with another scope PR, merge \`${STAGED_BRANCH}\` (umbrella) or combine changes manually._" \
-              > /tmp/child-body.md
-            gh pr create -R "$REPO" \
+              > "$RUNNER_TEMP/child-body.md"
+            gh pr create -R "${UI_REPO}" \
               --base "$STAGED_BRANCH" \
               --head "$CHILD" \
               --title "$PR_TITLE" \
-              --body-file /tmp/child-body.md
+              --body-file "$RUNNER_TEMP/child-body.md"
           done
-
-          if [ "$FAILURES" -gt 0 ]; then
-            echo "::warning::$FAILURES scope branch(es) failed cherry-pick; see logs above."
-          fi
 
           {
             echo "## PR split (deterministic)"
@@ -1133,4 +1021,15 @@ jobs:
             echo "- Children: \`$STAGED_BRANCH\` <- \`sync/myfinance-ui-${SHORT_SHA}-*\`"
             echo "- Agent branch: \`${AGENT_BRANCH}\`"
             echo "- Scopes: $(printf '%s, ' "${SCOPES[@]}")"
+            if [ "${#FAILED_SCOPES[@]}" -gt 0 ]; then
+              echo "- **Failed cherry-pick:** $(printf '%s, ' "${FAILED_SCOPES[@]}")"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+          # Hard-fail if any scope failed cherry-pick. Reviewers see red CI;
+          # the umbrella PR is still open so the operator can fall back to
+          # merging everything together if individual scopes can't be split.
+          if [ "$FAILURES" -gt 0 ]; then
+            echo "::error::$FAILURES scope branch(es) failed cherry-pick; see logs above."
+            exit 1
+          fi
