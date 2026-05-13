@@ -11,6 +11,7 @@ for it in this environment.
 - Triggered by:              ${ACTOR}
 - CHANGED_FILES:             ${CHANGED_FILES}             # JSON array — each entry is `{ "remote": "<path in API repo>", "local": "<path in schemas/>", "status": "added|modified|deleted" }`
 - SOURCE_SHA:                ${SOURCE_SHA}                # commit of the API repo CI synced from
+- BREAKING_CHANGES:          ${BREAKING_CHANGES}          # JSON object — keys are local schema filenames, values are arrays of `oasdiff breaking` records (`.id`, `.text`, …). Empty object `{}` means all changes are additive. See "## Breaking changes" below for how to use this.
 
 ## Hard rules
 
@@ -77,6 +78,43 @@ CI runs the matching `npm run codegen-*` script for every drifted schema on the 
 runner before you start, using credentials you do not have access to. The regenerated output
 is already on `HEAD` as the `chore(codegen):` commit. Column 4 of [`scripts/myfinance-schema-map.tsv`](../../scripts/myfinance-schema-map.tsv) records which script produced which generated files; consult it if you need to attribute pieces of the `chore(codegen):` diff.
 
+## Breaking changes
+
+CI ran `oasdiff breaking` between each MODIFIED schema's previous and new YAML before
+launching you. The result is in `BREAKING_CHANGES` (Inputs above): a JSON object keyed by
+local schema filename whose value is an array of records like
+`{ "id": "request-property-removed", "text": "removed property 'legacyId' …", … }`.
+
+When `BREAKING_CHANGES` is `{}`, the sync is purely additive — type the new properties and
+surface user-facing ones per §3b without further migration concerns.
+
+When `BREAKING_CHANGES` is non-empty, **prioritise migration over pure type-following** for
+the affected schemas. Specifically:
+
+- **Removed property** (`id` like `*-property-removed`): search for UI bindings to the old
+  name and either delete them or replace them with a real fallback derived from remaining
+  properties. A bare `// TODO(cursor-sync):` is not enough for a removed property — leave
+  a working migration, not a placeholder.
+- **Type narrowed** (`*-type-*`, `*-enum-value-removed`): existing UI code that assumed
+  any string is now wrong. Add input validation, narrow form-field types, and handle the
+  case where persisted state carries a value no longer in the enum.
+- **Required-ness added** (`*-property-became-required`): surface the field in the form so
+  the user must fill it; do not silently default it on the client.
+- **Removed enum value**: hide it from selects/badges; if persisted state could carry it,
+  add a "legacy value" fallback path or a migration.
+- **Operation / path removed**: delete the corresponding call sites and any UI affordances
+  that triggered them; an orphaned button is worse than no button.
+- **Special sentinel records** emitted by CI (not from oasdiff itself):
+  - `id: "schema-deleted"` — the schema file was deleted upstream; remove all UI usage of
+    that schema's types and endpoints.
+  - `id: "oasdiff-failed"` / `id: "oasdiff-unavailable"` — CI could not produce a clean
+    breaking-change report. Treat the schema as potentially breaking and inspect the YAML
+    diff (`git diff HEAD~2 HEAD~1 -- schemas/<filename>`) manually before adapting the UI;
+    mention this in the PR description.
+
+Mirror each addressed breaking change in the PR body under "Breaking changes addressed"
+(see §6) so reviewers can audit migration coverage at a glance.
+
 ## Steps
 
 ### 1. Trust the pre-computed CHANGED_FILES list
@@ -117,6 +155,10 @@ client surface look like — read it to see what API the UI now has to call.
 
 For **added** schemas, treat the whole file as new on `HEAD~1`. For **removed** schemas, remove
 UI and test usage as in 3c.
+
+Before applying changes, read `BREAKING_CHANGES` (see the "## Breaking changes" section
+above). Any record there should drive your migration plan for the affected schema — do
+those edits first, then handle the residual additive/type-only changes underneath.
 
 Then apply the matching code changes:
 
@@ -217,6 +259,7 @@ When Cursor opens the PR automatically (`autoCreatePR: true` — the default whe
 - **Renamed properties** table: `oldName | newName | files touched`.
 - **New properties surfaced** table: `property | UI surface(s) | rationale`.
 - **Removed properties** list.
+- **Breaking changes addressed** table — one row per non-empty `BREAKING_CHANGES` entry: `schema | oasdiff record (id + text) | migration applied`. When `BREAKING_CHANGES` is `{}`, write _"Additive only — no breaking changes per oasdiff."_ instead. CI also surfaces the same list on the umbrella PR body, so consistency here lets reviewers cross-check.
 - Any unmapped files or `TODO(cursor-sync)` comments left in the diff.
 - If the run aborted per Hard rules, say so prominently at the top.
 
