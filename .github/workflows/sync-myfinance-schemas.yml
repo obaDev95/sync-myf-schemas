@@ -113,6 +113,11 @@ jobs:
       source_sha: ${{ steps.diff.outputs.source_sha }}
       base_ref: ${{ steps.diff.outputs.base_ref }}
       staged_branch: ${{ steps.diff.outputs.staged_branch }}
+      # Set by the "Detect breaking changes" step. breaking_changes is a JSON
+      # object keyed by local schema filename → array of oasdiff records.
+      # total_breaking is an integer used to drive umbrella-PR labelling.
+      breaking_changes: ${{ steps.breaking.outputs.breaking_changes }}
+      total_breaking: ${{ steps.breaking.outputs.total_breaking }}
     steps:
       - uses: actions/checkout@v4
 
@@ -315,6 +320,114 @@ jobs:
             echo "**Pre-staged branch pushed:** \`$STAGE_BRANCH\` (Cloud Agent \`startingRef\`). Tip of branch will include the \`chore(schemas):\` commit plus a \`chore(codegen):\` commit pushed by the next job."
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # oasdiff classifies OpenAPI changes (removed properties, type narrowing,
+      # required-ness flips, etc.) as breaking vs additive. Its output drives:
+      #   - the umbrella PR body section (split-into-prs)
+      #   - the breaking-change / additive-only umbrella PR label
+      #   - the Cursor agent prompt (so the agent prioritises migrations over
+      #     pure type updates for affected schemas)
+      # See https://github.com/oasdiff/oasdiff for the CLI; pin VERSION below
+      # to a known-stable release and bump it deliberately.
+      - name: Install oasdiff
+        if: steps.diff.outputs.has_changes == 'true'
+        env:
+          OASDIFF_VERSION: "1.10.25"
+        run: |
+          set -euo pipefail
+          TMP=$(mktemp -d)
+          curl -fsSL "https://github.com/oasdiff/oasdiff/releases/download/v${OASDIFF_VERSION}/oasdiff_${OASDIFF_VERSION}_linux_amd64.tar.gz" \
+            | tar -xz -C "$TMP"
+          sudo install -m 0755 "$TMP/oasdiff" /usr/local/bin/oasdiff
+          rm -rf "$TMP"
+          oasdiff --version
+
+      - name: Detect breaking changes
+        id: breaking
+        if: steps.diff.outputs.has_changes == 'true'
+        env:
+          CHANGED_FILES: ${{ steps.diff.outputs.changed_files }}
+        run: |
+          set -euo pipefail
+          SRC=/tmp/api-src
+          UI_SRC=/tmp/ui-src
+
+          # JSON object keyed by local schema filename → array of oasdiff records.
+          BREAKING_BY_SCHEMA='{}'
+          TOTAL=0
+
+          while IFS= read -r row; do
+            status=$(echo "$row" | jq -r .status)
+            local_name=$(echo "$row" | jq -r .local)
+            remote_rel=$(echo "$row" | jq -r .remote)
+
+            case "$status" in
+              modified)
+                old_path="$UI_SRC/schemas/$local_name"
+                new_path="$SRC/$remote_rel"
+                if [ ! -f "$old_path" ] || [ ! -f "$new_path" ]; then
+                  echo "::warning::Missing input file(s) for oasdiff on $local_name; recording as undiagnosed."
+                  ENTRY='[{"id":"oasdiff-unavailable","text":"could not run oasdiff: input file missing"}]'
+                else
+                  # --fail-on NONE keeps the exit code at 0 even when breaking
+                  # changes are present; we read the JSON ourselves to decide.
+                  # On parse failures (corrupt YAML, unsupported OpenAPI extension)
+                  # oasdiff exits non-zero — fall back to a marker entry so the
+                  # workflow continues and operators see the issue on the PR.
+                  if ENTRY=$(oasdiff breaking "$old_path" "$new_path" --format json --fail-on NONE 2>/tmp/oasdiff.err); then
+                    : # ENTRY contains JSON
+                  else
+                    ERR=$(tr -d '\n' < /tmp/oasdiff.err | head -c 240)
+                    echo "::warning::oasdiff failed on $local_name: $ERR"
+                    ENTRY=$(jq -n --arg t "oasdiff failed: $ERR" '[{"id":"oasdiff-failed","text":$t}]')
+                  fi
+                  # Normalise: oasdiff emits literal `null` when no breaking changes.
+                  if [ -z "$ENTRY" ] || [ "$ENTRY" = "null" ]; then
+                    ENTRY='[]'
+                  fi
+                fi
+                ;;
+              deleted)
+                # Removing a tracked schema is unambiguously breaking; synthesise
+                # one record so the PR label + body capture it without depending
+                # on oasdiff (which has nothing on the "new" side to diff).
+                ENTRY=$(jq -n --arg n "$local_name" \
+                  '[{"id":"schema-deleted","text":("removed schema file " + $n)}]')
+                ;;
+              added)
+                # New endpoints/properties are inherently non-breaking for callers.
+                ENTRY='[]'
+                ;;
+              *)
+                ENTRY='[]'
+                ;;
+            esac
+
+            COUNT=$(echo "$ENTRY" | jq 'length')
+            if [ "$COUNT" -gt 0 ]; then
+              BREAKING_BY_SCHEMA=$(echo "$BREAKING_BY_SCHEMA" \
+                | jq --arg k "$local_name" --argjson v "$ENTRY" '. + { ($k): $v }')
+              TOTAL=$((TOTAL + COUNT))
+            fi
+          done < <(echo "$CHANGED_FILES" | jq -c '.[]')
+
+          echo "breaking_changes=$(echo "$BREAKING_BY_SCHEMA" | jq -c '.')" >> "$GITHUB_OUTPUT"
+          echo "total_breaking=$TOTAL" >> "$GITHUB_OUTPUT"
+
+          {
+            echo ""
+            if [ "$TOTAL" -eq 0 ]; then
+              echo "**Breaking changes:** none (all changes additive)."
+            else
+              echo "**Breaking changes detected ($TOTAL):**"
+              echo ""
+              while IFS= read -r sch; do
+                echo "_${sch}_:"
+                echo "$BREAKING_BY_SCHEMA" | jq -r --arg k "$sch" '.[$k][] | "- \(.text // .id)"'
+                echo ""
+              done < <(echo "$BREAKING_BY_SCHEMA" | jq -r 'keys[]')
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ──────────────────────────────────────────────────────────────────────
   # Job 1b: Run codegen on the GitHub-hosted runner (NOT in the Cursor sandbox).
   # The Cursor cloud agent has no GitHub Packages credentials by design — registry
@@ -465,13 +578,17 @@ jobs:
           ACTOR: ${{ github.actor }}
           CHANGED_FILES: ${{ needs.detect-drift.outputs.changed_files }}
           SOURCE_SHA: ${{ needs.detect-drift.outputs.source_sha }}
+          # detect-drift emits an empty object when nothing is breaking;
+          # envsubst on `{}` is harmless. The prompt instructs the agent how
+          # to read this for migration prioritisation.
+          BREAKING_CHANGES: ${{ needs.detect-drift.outputs.breaking_changes }}
         run: |
           set -euo pipefail
           # Allowlist the variables we actually template into the prompt; without
           # this, any `$IDENT` later added to the markdown (e.g. inside a code
           # block illustrating a shell command) would be silently consumed.
           PROMPT=$(envsubst \
-            '$SCHEMA $SPLIT_INTO_PR_PER_SCHEMA $SELECTED_SCHEMAS $ACTOR $CHANGED_FILES $SOURCE_SHA' \
+            '$SCHEMA $SPLIT_INTO_PR_PER_SCHEMA $SELECTED_SCHEMAS $ACTOR $CHANGED_FILES $SOURCE_SHA $BREAKING_CHANGES' \
             < .cursor/prompts/sync-myfinance-schemas.md)
           # Write to a file — do not pass the prompt via GITHUB_OUTPUT or inline
           # workflow expressions into the next step's shell; JSON/markdown/newlines/braces
@@ -814,25 +931,60 @@ jobs:
           BASE_REF: ${{ needs.detect-drift.outputs.base_ref }}
           SOURCE_SHA: ${{ needs.detect-drift.outputs.source_sha }}
           SELECTED_SCHEMAS: ${{ needs.detect-drift.outputs.selected_schemas }}
+          BREAKING_CHANGES: ${{ needs.detect-drift.outputs.breaking_changes }}
+          TOTAL_BREAKING: ${{ needs.detect-drift.outputs.total_breaking }}
         run: |
           set -euo pipefail
+
+          # Render the breaking-changes section once; reuse for new PR body and
+          # (when the umbrella already exists) to refresh its body.
+          BREAKING_MD="$RUNNER_TEMP/breaking-section.md"
+          : > "$BREAKING_MD"
+          if [ "${TOTAL_BREAKING:-0}" -gt 0 ]; then
+            LABEL="breaking-change"
+            {
+              echo "**Breaking changes detected (${TOTAL_BREAKING}):**"
+              echo ""
+              while IFS= read -r sch; do
+                echo "_${sch}_:"
+                echo "$BREAKING_CHANGES" | jq -r --arg k "$sch" '.[$k][] | "- \(.text // .id)"'
+                echo ""
+              done < <(echo "$BREAKING_CHANGES" | jq -r 'keys[]')
+            } >> "$BREAKING_MD"
+          else
+            LABEL="additive-only"
+            echo "**Breaking changes:** none (all changes additive)." >> "$BREAKING_MD"
+          fi
+
+          # Ensure both labels exist on ui-myfinance so --label below doesn't 422.
+          # Idempotent: a missing-permission or already-exists case is non-fatal.
+          gh label create breaking-change -R "${UI_REPO}" \
+            --color 'D93F0B' \
+            --description 'Sync includes one or more breaking schema changes (oasdiff).' 2>/dev/null || true
+          gh label create additive-only -R "${UI_REPO}" \
+            --color '0E8A16' \
+            --description 'Sync is purely additive (oasdiff: no breaking changes).' 2>/dev/null || true
+
           # Check across all states (open, closed, merged). If a previous run created an
           # umbrella for the same staged branch and it was closed without merging — e.g.
           # operator cancelled mid-flight — gh pr create would otherwise fail the whole
           # split job. Reuse the existing PR record and warn instead of creating a duplicate.
           EXISTING=$(gh pr list -R "${UI_REPO}" --base "$BASE_REF" --head "$STAGED_BRANCH" --state all --json number,state -q '.[0]' || echo "")
           if [ -z "${EXISTING}" ]; then
-            printf '%s\n' \
-              "Automated schema sync from API-JSON-Schema-Definitions @ \`${SOURCE_SHA}\`." \
-              "" \
-              "Child PRs (one per Conventional Commit scope) target branch \`${STAGED_BRANCH}\` after the Cloud Agent run when **split_into_pr_per_schema** is enabled." \
-              "" \
-              "**Slugs in this run:** \`${SELECTED_SCHEMAS}\`" \
-              > "$RUNNER_TEMP/umbrella-body.md"
+            {
+              echo "Automated schema sync from API-JSON-Schema-Definitions @ \`${SOURCE_SHA}\`."
+              echo ""
+              echo "Child PRs (one per Conventional Commit scope) target branch \`${STAGED_BRANCH}\` after the Cloud Agent run when **split_into_pr_per_schema** is enabled."
+              echo ""
+              echo "**Slugs in this run:** \`${SELECTED_SCHEMAS}\`"
+              echo ""
+              cat "$BREAKING_MD"
+            } > "$RUNNER_TEMP/umbrella-body.md"
             gh pr create -R "${UI_REPO}" \
               --base "$BASE_REF" \
               --head "$STAGED_BRANCH" \
               --title "chore(schemas): sync myfinance YAMLs from API @ ${SOURCE_SHA}" \
+              --label "$LABEL" \
               --body-file "$RUNNER_TEMP/umbrella-body.md"
           else
             EX_NUM=$(echo "$EXISTING" | jq -r '.number')
@@ -841,6 +993,15 @@ jobs:
             if [ "$EX_STATE" = "CLOSED" ]; then
               echo "::warning::Umbrella PR #${EX_NUM} was closed without merging. Reopen it manually if you intend to ship this sync, or delete branch ${STAGED_BRANCH} to start fresh."
             fi
+            # Re-assert the correct label on re-runs. The breaking-change
+            # verdict can flip between runs if the API team amends the schema,
+            # so we add the current label and clear the opposite. Both gh
+            # operations are tolerant of the label already being in the right
+            # state; the `|| true` guards on the remove-label call ensure a
+            # missing opposite label doesn't fail the step.
+            OPPOSITE=$([ "$LABEL" = "breaking-change" ] && echo additive-only || echo breaking-change)
+            gh pr edit "$EX_NUM" -R "${UI_REPO}" --add-label "$LABEL" || true
+            gh pr edit "$EX_NUM" -R "${UI_REPO}" --remove-label "$OPPOSITE" 2>/dev/null || true
           fi
 
       - name: Cherry-pick by scope and open per-scope PRs
