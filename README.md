@@ -27,9 +27,12 @@ Omit the filename to be prompted with the list of known schemas
 
 ## How it works
 
-1. `scripts/prep-myfinance-sync.sh` (deterministic) fetches the named schema file(s) from
-   `API-JSON-Schema-Definitions` and writes them into `schemas/`. Unknown filenames fail fast
-   with the list of valid ones.
+1. `scripts/prep-myfinance-sync.sh` (deterministic) fetches `origin` fresh, diffs the named
+   schema file(s) from `API-JSON-Schema-Definitions` against `origin/<default-branch>` (never
+   the local working tree, so a stale checkout can't re-surface changes already merged
+   upstream), and — only if something actually drifted — creates a sync branch off that fresh
+   baseline and writes the files into `schemas/`. Unknown filenames fail fast with the list of
+   valid ones; a dirty working tree aborts before anything is touched.
 2. The `schema-adapter` subagent runs the matching `npm run codegen-*` script, adapts UI/types/
    business logic/tests to the diff, and iterates until `npm run typecheck` and
    `npm run test:unit` pass.
