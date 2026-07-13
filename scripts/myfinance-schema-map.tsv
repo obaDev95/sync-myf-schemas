@@ -1,22 +1,18 @@
 # Source of truth for myfinance schema mapping.
 # Consumed by:
-#   .github/workflows/sync-myfinance-schemas.yml  (detect-drift slug emission + all-slugs allowlist, run-codegen script lookup, split-into-prs scope validation)
-#   scripts/detect-myfinance-schema-drift.sh      (local parity)
-#   .cursor/prompts/sync-myfinance-schemas.md     (slug table — must match column 3 of this file)
+#   scripts/prep-myfinance-sync.sh   (remote lookup + codegen script resolution)
+#   commands/sync.md                 (schema list shown when no filename is given)
 #
 # Columns (TAB-separated, blank lines and lines starting with `#` are skipped):
 #   1. remote_path     Path in Maersk-Global/API-JSON-Schema-Definitions
 #   2. local_name      Filename under ui-myfinance/schemas/
-#   3. slug            Conventional Commit scope when split_into_pr_per_schema=true
-#   4. codegen_script  npm script in ui-myfinance/package.json (without `npm run` prefix)
+#   3. codegen_script  npm script in ui-myfinance/package.json (without `npm run` prefix)
 #
-# Adding a new schema also requires extending the `schema:` choice options in the
-# workflow (workflow_dispatch inputs cannot be loaded dynamically) and the human-readable
-# tables in the prompt. Consider a future CI guard that reconciles them against this file.
-apis/500-Maersk.com/v1/myfinance-invoices-API.v1.yml	myfinance-invoices-API.v1.yml	invoices-v1	codegen-invoices
-apis/500-Maersk.com/v2/myfinance-invoices-API.v2.yaml	myfinance-invoices-API.v2.yaml	invoices-v2	codegen-invoices-v2
-apis/500-Maersk.com/v1/myfinance-submit-proof-of-payment-API.v1.yaml	myfinance-submit-proof-of-payment-API.v1.yaml	submit-proof-of-payment	codegen-proof-of-payment
-apis/500-Maersk.com/v1/35-myfinance-export-documents-API.v1.yml	myfinance-export-documents-API.v1.yml	export-documents	codegen-export-documents
-apis/500-Maersk.com/v1/myfinance-refund-request-API.v1.yaml	myfinance-refund-request-API.v1.yaml	refund-request	codegen-refund-request
-apis/500-Maersk.com/v1/myfinance-estatements-API.v1.yml	myfinance-estatements-API.v1.yml	estatements	codegen-estatements
-apis/500-Maersk.com/v1/myfinance-workflows-API.v1.yaml	myfinance-workflows-API.v1.yaml	workflows	codegen-workflows
+# Adding a new schema is just a new row here.
+apis/500-Maersk.com/v1/myfinance-invoices-API.v1.yml	myfinance-invoices-API.v1.yml	codegen-invoices
+apis/500-Maersk.com/v2/myfinance-invoices-API.v2.yaml	myfinance-invoices-API.v2.yaml	codegen-invoices-v2
+apis/500-Maersk.com/v1/myfinance-submit-proof-of-payment-API.v1.yaml	myfinance-submit-proof-of-payment-API.v1.yaml	codegen-proof-of-payment
+apis/500-Maersk.com/v1/35-myfinance-export-documents-API.v1.yml	myfinance-export-documents-API.v1.yml	codegen-export-documents
+apis/500-Maersk.com/v1/myfinance-refund-request-API.v1.yaml	myfinance-refund-request-API.v1.yaml	codegen-refund-request
+apis/500-Maersk.com/v1/myfinance-estatements-API.v1.yml	myfinance-estatements-API.v1.yml	codegen-estatements
+apis/500-Maersk.com/v1/myfinance-workflows-API.v1.yaml	myfinance-workflows-API.v1.yaml	codegen-workflows

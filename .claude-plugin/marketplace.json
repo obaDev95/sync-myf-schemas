@@ -1,0 +1,14 @@
+{
+  "name": "maersk-myfinance",
+  "description": "Maersk myfinance internal Claude Code plugins",
+  "owner": {
+    "name": "MyFinance UI"
+  },
+  "plugins": [
+    {
+      "name": "myfinance-sync",
+      "source": ".",
+      "description": "Sync myfinance OAS schema changes into ui-myfinance"
+    }
+  ]
+}
