@@ -35,10 +35,22 @@ Run from inside a local `ui-myfinance` checkout (`Maersk-Global/ui-myfinance`).
 
 4. **Adapt.** Dispatch the `myfinance-sync:schema-adapter` subagent (foreground — you need its
    result before continuing) with the full prep output (`SOURCE_SHA`, `BRANCH`, and the
-   per-schema status/local/codegen lines) as its brief.
+   per-schema status/local/codegen/client lines) as its brief.
 
-5. **Ship.** If the subagent completed without aborting, on the `BRANCH` prep already checked
-   out:
+5. **Scope check.** Before committing anything, verify the working tree only drifted the schema(s)
+   you asked for:
+   ```
+   git diff --name-only "origin/<default-branch>" -- schemas/ src/auto/api/
+   ```
+   Every `schemas/*` path listed must be one of the schema file(s) passed to prep. Every
+   `src/auto/api/*` path listed must equal the `client=` value reported for one of the synced
+   schemas in step 3's output. If any other path under `schemas/` or `src/auto/api/` shows up —
+   another schema drifted in, or its generated client got touched — **stop, do not commit or
+   push**. Report the stray path(s) verbatim and tell the user the tree went out of scope; leave
+   the branch in place for inspection, same as an aborted subagent below.
+
+6. **Ship.** If the subagent completed without aborting and the scope check passed, on the
+   `BRANCH` prep already checked out:
    - `git add -A && git commit -m "chore(sync): myfinance schema sync @ <short-source-sha>"`
      (one commit — this is a local, reviewed-before-push flow, not the old split-PR pipeline)
    - `git push -u origin HEAD`

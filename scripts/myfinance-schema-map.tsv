@@ -4,15 +4,18 @@
 #   commands/sync.md                 (schema list shown when no filename is given)
 #
 # Columns (TAB-separated, blank lines and lines starting with `#` are skipped):
-#   1. remote_path     Path in Maersk-Global/API-JSON-Schema-Definitions
-#   2. local_name      Filename under ui-myfinance/schemas/
-#   3. codegen_script  npm script in ui-myfinance/package.json (without `npm run` prefix)
+#   1. remote_path       Path in Maersk-Global/API-JSON-Schema-Definitions
+#   2. local_name        Filename under ui-myfinance/schemas/
+#   3. codegen_script    npm script in ui-myfinance/package.json (without `npm run` prefix)
+#   4. generated_client  Path under ui-myfinance/src/auto/api/ that codegen_script writes (the
+#                        `-n <name>` argument of that script) — used to scope-check that a sync
+#                        only touched its own generated client, not another schema's.
 #
 # Adding a new schema is just a new row here.
-apis/500-Maersk.com/v1/myfinance-invoices-API.v1.yml	myfinance-invoices-API.v1.yml	codegen-invoices
-apis/500-Maersk.com/v2/myfinance-invoices-API.v2.yaml	myfinance-invoices-API.v2.yaml	codegen-invoices-v2
-apis/500-Maersk.com/v1/myfinance-submit-proof-of-payment-API.v1.yaml	myfinance-submit-proof-of-payment-API.v1.yaml	codegen-proof-of-payment
-apis/500-Maersk.com/v1/35-myfinance-export-documents-API.v1.yml	myfinance-export-documents-API.v1.yml	codegen-export-documents
-apis/500-Maersk.com/v1/myfinance-refund-request-API.v1.yaml	myfinance-refund-request-API.v1.yaml	codegen-refund-request
-apis/500-Maersk.com/v1/myfinance-estatements-API.v1.yml	myfinance-estatements-API.v1.yml	codegen-estatements
-apis/500-Maersk.com/v1/myfinance-workflows-API.v1.yaml	myfinance-workflows-API.v1.yaml	codegen-workflows
+apis/500-Maersk.com/v1/myfinance-invoices-API.v1.yml	myfinance-invoices-API.v1.yml	codegen-invoices	src/auto/api/invoices.ts
+apis/500-Maersk.com/v2/myfinance-invoices-API.v2.yaml	myfinance-invoices-API.v2.yaml	codegen-invoices-v2	src/auto/api/invoices-v2.ts
+apis/500-Maersk.com/v1/myfinance-submit-proof-of-payment-API.v1.yaml	myfinance-submit-proof-of-payment-API.v1.yaml	codegen-proof-of-payment	src/auto/api/proof-of-payment.ts
+apis/500-Maersk.com/v1/35-myfinance-export-documents-API.v1.yml	myfinance-export-documents-API.v1.yml	codegen-export-documents	src/auto/api/export-documents.ts
+apis/500-Maersk.com/v1/myfinance-refund-request-API.v1.yaml	myfinance-refund-request-API.v1.yaml	codegen-refund-request	src/auto/api/refund-request.ts
+apis/500-Maersk.com/v1/myfinance-estatements-API.v1.yml	myfinance-estatements-API.v1.yml	codegen-estatements	src/auto/api/estatements.ts
+apis/500-Maersk.com/v1/myfinance-workflows-API.v1.yaml	myfinance-workflows-API.v1.yaml	codegen-workflows	src/auto/api/workflows.ts

@@ -22,6 +22,11 @@ You will be told, per schema: `status` (added | modified | deleted), the `local`
   why instead of guessing.
 - **Never create, read, or reference `.npmrc` or any `.env*` file.** If one appears in
   `git status` after codegen, do not stage it and flag it immediately.
+- **Stay inside the synced schema's blast radius.** Only run the codegen script(s) named in your
+  brief. Never edit another schema's file under `schemas/`, never run another schema's codegen, and
+  never hand-edit another schema's generated client under `src/auto/api/`. If adapting the target
+  schema appears to require changing another schema or its generated client, stop and report — that
+  is an out-of-scope diff, not a task.
 
 ## Steps
 

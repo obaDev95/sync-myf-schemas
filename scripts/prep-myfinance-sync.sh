@@ -96,11 +96,12 @@ for local_name in "$@"; do
   fi
   remote_rel=$(echo "$row" | cut -f1)
   codegen=$(echo "$row" | cut -f3)
+  client=$(echo "$row" | cut -f4)
   remote_path="$API_DIR/$remote_rel"
 
   if [ ! -f "$remote_path" ]; then
     if exists_on_default "$local_name"; then
-      DRIFTED+=("$local_name|deleted|$codegen|$remote_path")
+      DRIFTED+=("$local_name|deleted|$codegen|$remote_path|$client")
     else
       echo "note: $local_name has no remote file and isn't on origin/$DEFAULT_BRANCH — nothing to do" >&2
     fi
@@ -116,7 +117,7 @@ for local_name in "$@"; do
   else
     status=added
   fi
-  DRIFTED+=("$local_name|$status|$codegen|$remote_path")
+  DRIFTED+=("$local_name|$status|$codegen|$remote_path|$client")
 done
 
 if [ "${#DRIFTED[@]}" -eq 0 ]; then
@@ -143,7 +144,7 @@ echo "BRANCH: $BRANCH"
 echo ""
 echo "CHANGED SCHEMAS:"
 for entry in "${DRIFTED[@]}"; do
-  IFS='|' read -r local_name status codegen remote_path <<< "$entry"
+  IFS='|' read -r local_name status codegen remote_path client <<< "$entry"
   local_path="schemas/$local_name"
   if [ "$status" = "deleted" ]; then
     git rm -q -f "$local_path"
@@ -151,5 +152,5 @@ for entry in "${DRIFTED[@]}"; do
     mkdir -p schemas
     cp "$remote_path" "$local_path"
   fi
-  echo "status=$status local=$local_name codegen=$codegen"
+  echo "status=$status local=$local_name codegen=$codegen client=$client"
 done
