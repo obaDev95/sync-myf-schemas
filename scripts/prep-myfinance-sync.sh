@@ -79,6 +79,11 @@ exists_on_default() {
   git cat-file -e "origin/$DEFAULT_BRANCH:schemas/$1" 2>/dev/null
 }
 
+# e.g. myfinance-export-documents-API.v1.yml -> export-documents-v1
+slug_for() {
+  echo "$1" | sed -E 's/\.ya?ml$//; s/^myfinance-//; s/-API\./-/' | tr '[:upper:]' '[:lower:]'
+}
+
 # Classify against the freshly fetched remote default branch, NOT the local
 # working tree — a stale local checkout must never make an already-synced
 # schema look like it still needs syncing (or vice versa). Plain indexed
@@ -137,7 +142,30 @@ if [ -n "$(git status --porcelain)" ]; then
   exit 1
 fi
 
-BRANCH="sync/myfinance-${SHORT_SHA}-$(date +%Y%m%d)"
+# Schema-specific branch name so two different same-day syncs (SOURCE_SHA and
+# date alone don't change within a day) never collide with each other.
+SLUGS=""
+for entry in "${DRIFTED[@]}"; do
+  IFS='|' read -r local_name _status _codegen _remote_path _client <<< "$entry"
+  s=$(slug_for "$local_name")
+  SLUGS="${SLUGS:+$SLUGS-}$s"
+done
+
+BRANCH="sync/myfinance-${SHORT_SHA}-${SLUGS}-$(date +%Y%m%d)"
+if [ "${#BRANCH}" -gt 80 ]; then
+  # Many schemas at once — collapse to a short digest rather than an unwieldy ref name.
+  HASH=$(printf '%s' "$SLUGS" | shasum | cut -c1-6)
+  BRANCH="sync/myfinance-${SHORT_SHA}-${HASH}-$(date +%Y%m%d)"
+fi
+
+# Fail loud on a name collision instead of guessing (auto-suffixing, reusing,
+# or stacking onto an existing branch) — a prior same-day run for the same
+# schema(s) needs the developer's judgment, not ours.
+if git show-ref --verify --quiet "refs/heads/$BRANCH" || git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+  echo "error: branch '$BRANCH' already exists (local or on origin) — likely a prior sync run for these schema(s) today. Finish, push, or delete that branch before re-running, or retry tomorrow." >&2
+  exit 1
+fi
+
 git checkout -q -b "$BRANCH" "origin/$DEFAULT_BRANCH"
 
 echo "BRANCH: $BRANCH"
