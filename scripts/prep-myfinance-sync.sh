@@ -12,6 +12,14 @@
 # local working tree — otherwise a stale local checkout re-introduces schema
 # changes that are already merged upstream.
 #
+# The API repo is likewise re-cloned from scratch every run (no reused
+# checkout to go stale) and, with no --branch given, git checks out whatever
+# that remote's HEAD currently points at — its latest default branch tip, no
+# separate fetch/pull step needed. The clone is blobless (--filter=blob:none)
+# rather than shallow, so full commit history is kept: that's what lets the
+# per-schema `source:` line below report the commit that actually last
+# touched each file, not just the tip commit of a shallow clone.
+#
 # Auth: uses your existing git/SSH access to Maersk-Global by default. Set
 # MAERSK_SCHEMAS_PAT (fine-grained PAT, Contents:Read on
 # API-JSON-Schema-Definitions) to use HTTPS + token instead.
@@ -57,16 +65,17 @@ echo "Fetching Maersk-Global/API-JSON-Schema-Definitions ..." >&2
 rm -rf "$API_DIR"
 if [ -n "${API_SRC_URL:-}" ]; then
   # Local dev / test override — point at a fixture instead of the real org repo.
-  git clone --depth=1 "$API_SRC_URL" "$API_DIR" >&2
+  git clone --filter=blob:none "$API_SRC_URL" "$API_DIR" >&2
 elif [ -n "${MAERSK_SCHEMAS_PAT:-}" ]; then
-  git clone --depth=1 "https://x-access-token:${MAERSK_SCHEMAS_PAT}@github.com/${API_REPO}" "$API_DIR" >&2
+  git clone --filter=blob:none "https://x-access-token:${MAERSK_SCHEMAS_PAT}@github.com/${API_REPO}" "$API_DIR" >&2
 else
-  git clone --depth=1 "git@github.com:${API_REPO}.git" "$API_DIR" >&2
+  git clone --filter=blob:none "git@github.com:${API_REPO}.git" "$API_DIR" >&2
 fi
 SOURCE_SHA=$(git -C "$API_DIR" rev-parse HEAD)
 SHORT_SHA="${SOURCE_SHA:0:7}"
+API_BRANCH=$(git -C "$API_DIR" rev-parse --abbrev-ref HEAD)
 
-echo "SOURCE_SHA: $SOURCE_SHA"
+echo "SOURCE_SHA: $SOURCE_SHA (branch $API_BRANCH)"
 echo "DEFAULT_BRANCH: origin/$DEFAULT_BRANCH"
 
 # Portable lookup (no associative arrays — macOS ships bash 3.2, which lacks
@@ -104,9 +113,14 @@ for local_name in "$@"; do
   client=$(echo "$row" | cut -f4)
   remote_path="$API_DIR/$remote_rel"
 
+  # Which API-repo commit last touched this file — printed alongside the
+  # result so a user who doubts freshness can check provenance at a glance
+  # instead of re-diffing repos by hand.
+  source_commit=$(git -C "$API_DIR" log -1 --format='%h %cs %s' -- "$remote_rel" 2>/dev/null)
+
   if [ ! -f "$remote_path" ]; then
     if exists_on_default "$local_name"; then
-      DRIFTED+=("$local_name|deleted|$codegen|$remote_path|$client")
+      DRIFTED+=("$local_name|deleted|$codegen|$remote_path|$client|$source_commit")
     else
       echo "note: $local_name has no remote file and isn't on origin/$DEFAULT_BRANCH — nothing to do" >&2
     fi
@@ -122,7 +136,7 @@ for local_name in "$@"; do
   else
     status=added
   fi
-  DRIFTED+=("$local_name|$status|$codegen|$remote_path|$client")
+  DRIFTED+=("$local_name|$status|$codegen|$remote_path|$client|$source_commit")
 done
 
 if [ "${#DRIFTED[@]}" -eq 0 ]; then
@@ -172,7 +186,7 @@ echo "BRANCH: $BRANCH"
 echo ""
 echo "CHANGED SCHEMAS:"
 for entry in "${DRIFTED[@]}"; do
-  IFS='|' read -r local_name status codegen remote_path client <<< "$entry"
+  IFS='|' read -r local_name status codegen remote_path client source_commit <<< "$entry"
   local_path="schemas/$local_name"
   if [ "$status" = "deleted" ]; then
     git rm -q -f "$local_path"
@@ -181,4 +195,5 @@ for entry in "${DRIFTED[@]}"; do
     cp "$remote_path" "$local_path"
   fi
   echo "status=$status local=$local_name codegen=$codegen client=$client"
+  echo "  source: $API_REPO@${source_commit:-unknown}"
 done
