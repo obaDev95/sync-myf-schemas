@@ -104,9 +104,14 @@ for local_name in "$@"; do
   client=$(echo "$row" | cut -f4)
   remote_path="$API_DIR/$remote_rel"
 
+  # Which API-repo commit last touched this file — printed alongside the
+  # result so a user who doubts freshness can check provenance at a glance
+  # instead of re-diffing repos by hand.
+  source_commit=$(git -C "$API_DIR" log -1 --format='%h %cs %s' -- "$remote_rel" 2>/dev/null)
+
   if [ ! -f "$remote_path" ]; then
     if exists_on_default "$local_name"; then
-      DRIFTED+=("$local_name|deleted|$codegen|$remote_path|$client")
+      DRIFTED+=("$local_name|deleted|$codegen|$remote_path|$client|$source_commit")
     else
       echo "note: $local_name has no remote file and isn't on origin/$DEFAULT_BRANCH — nothing to do" >&2
     fi
@@ -122,7 +127,7 @@ for local_name in "$@"; do
   else
     status=added
   fi
-  DRIFTED+=("$local_name|$status|$codegen|$remote_path|$client")
+  DRIFTED+=("$local_name|$status|$codegen|$remote_path|$client|$source_commit")
 done
 
 if [ "${#DRIFTED[@]}" -eq 0 ]; then
@@ -172,7 +177,7 @@ echo "BRANCH: $BRANCH"
 echo ""
 echo "CHANGED SCHEMAS:"
 for entry in "${DRIFTED[@]}"; do
-  IFS='|' read -r local_name status codegen remote_path client <<< "$entry"
+  IFS='|' read -r local_name status codegen remote_path client source_commit <<< "$entry"
   local_path="schemas/$local_name"
   if [ "$status" = "deleted" ]; then
     git rm -q -f "$local_path"
@@ -181,4 +186,5 @@ for entry in "${DRIFTED[@]}"; do
     cp "$remote_path" "$local_path"
   fi
   echo "status=$status local=$local_name codegen=$codegen client=$client"
+  echo "  source: $API_REPO@${source_commit:-unknown}"
 done
