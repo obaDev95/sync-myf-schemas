@@ -12,6 +12,14 @@
 # local working tree — otherwise a stale local checkout re-introduces schema
 # changes that are already merged upstream.
 #
+# The API repo is likewise re-cloned from scratch every run (no reused
+# checkout to go stale) and, with no --branch given, git checks out whatever
+# that remote's HEAD currently points at — its latest default branch tip, no
+# separate fetch/pull step needed. The clone is blobless (--filter=blob:none)
+# rather than shallow, so full commit history is kept: that's what lets the
+# per-schema `source:` line below report the commit that actually last
+# touched each file, not just the tip commit of a shallow clone.
+#
 # Auth: uses your existing git/SSH access to Maersk-Global by default. Set
 # MAERSK_SCHEMAS_PAT (fine-grained PAT, Contents:Read on
 # API-JSON-Schema-Definitions) to use HTTPS + token instead.
@@ -57,16 +65,17 @@ echo "Fetching Maersk-Global/API-JSON-Schema-Definitions ..." >&2
 rm -rf "$API_DIR"
 if [ -n "${API_SRC_URL:-}" ]; then
   # Local dev / test override — point at a fixture instead of the real org repo.
-  git clone --depth=1 "$API_SRC_URL" "$API_DIR" >&2
+  git clone --filter=blob:none "$API_SRC_URL" "$API_DIR" >&2
 elif [ -n "${MAERSK_SCHEMAS_PAT:-}" ]; then
-  git clone --depth=1 "https://x-access-token:${MAERSK_SCHEMAS_PAT}@github.com/${API_REPO}" "$API_DIR" >&2
+  git clone --filter=blob:none "https://x-access-token:${MAERSK_SCHEMAS_PAT}@github.com/${API_REPO}" "$API_DIR" >&2
 else
-  git clone --depth=1 "git@github.com:${API_REPO}.git" "$API_DIR" >&2
+  git clone --filter=blob:none "git@github.com:${API_REPO}.git" "$API_DIR" >&2
 fi
 SOURCE_SHA=$(git -C "$API_DIR" rev-parse HEAD)
 SHORT_SHA="${SOURCE_SHA:0:7}"
+API_BRANCH=$(git -C "$API_DIR" rev-parse --abbrev-ref HEAD)
 
-echo "SOURCE_SHA: $SOURCE_SHA"
+echo "SOURCE_SHA: $SOURCE_SHA (branch $API_BRANCH)"
 echo "DEFAULT_BRANCH: origin/$DEFAULT_BRANCH"
 
 # Portable lookup (no associative arrays — macOS ships bash 3.2, which lacks
