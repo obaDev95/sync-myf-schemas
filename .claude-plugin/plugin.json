@@ -2,7 +2,6 @@
   "name": "myfinance-sync",
   "displayName": "MyFinance Schema Sync",
   "description": "Sync myfinance OAS schema changes from API-JSON-Schema-Definitions into ui-myfinance: regenerate types, adapt UI/business logic/tests, and open a PR.",
-  "version": "0.1.0",
   "author": {
     "name": "MyFinance UI"
   }
