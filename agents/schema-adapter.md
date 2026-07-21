@@ -54,6 +54,16 @@ state/getters/actions, component props/refs/computed/watch, template bindings (`
 validation rules, i18n keys mirroring the property name, mock data, MSW handlers, Vitest/Cypress
 fixtures.
 
+This includes **whole generated types/interfaces**, not just object properties: any schema change
+that causes `swagger-typescript-api` to rename a generated type (e.g. an added/changed
+`operationId`) can have that type re-sort elsewhere in the file, since the codegen script sorts
+generated types alphabetically. `git diff` then shows this as an unrelated delete-block +
+add-block instead of a rename, even though the body (fields, JSDoc) is unchanged. When you see a
+deleted interface/type/enum and an added one with an identical or near-identical body, treat it as
+a rename regardless of which schema produced it: apply the same `oldName` → `newName`
+search-and-replace across the repo (3a above), and record it under "Renamed generated types" in
+your summary (5) rather than leaving it looking like unrelated churn.
+
 #### 3b. Added properties
 Always type them. Decide UI surfacing per property: user-facing data (new column, new attribute)
 → surface in the relevant table column / detail panel / form field / filter, matching the
@@ -90,6 +100,9 @@ End with a summary — this becomes the PR body:
 
 - **Schemas processed** — table of `local | status | codegen script run`.
 - **Renamed properties** — `oldName | newName | files touched`.
+- **Renamed generated types** — `oldTypeName | newTypeName | reason (e.g. new operationId)`. Call
+  these out explicitly so a reviewer looking at a delete+add pair in the generated client diff
+  knows it's a rename, not new content duplicating something already on the target branch.
 - **New properties surfaced** — `property | UI surface(s) | rationale`.
 - **Removed properties** — list.
 - **Decisions deferred to reviewer** — any `TODO(myfinance-sync)` left in the diff.
